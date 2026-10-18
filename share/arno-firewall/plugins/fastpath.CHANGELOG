@@ -1,0 +1,27 @@
+Flow Offload (fastpath) plugin
+==============================
+
+Target hardware: PC Engines APU2.
+
+1.03  - Leave the flowtable TCP/UDP inactivity timeouts at the kernel
+        default (30 s); they are now an opt-in override in fastpath.conf.
+      - Document how to find the NIC's maximum ring-buffer size with
+        "ethtool -g" (use the RX/TX values under "Pre-set maximums").
+
+1.02  - Document that this plugin targets PC Engines APU2 hardware.
+
+1.01  - Rebuild the fastpath when its device set (or a device's ifindex)
+        changes, eg. when the WAN netdev was removed and brought up again.
+        Tracked via a fingerprint stored in /var/tmp/anf_fastpath_state.
+
+1.00  - Initial release.
+      - Enable the nftables flowtable fastpath for forwarded TCP/UDP traffic,
+        managed in an isolated "inet fastpath" table (never part of the ANF
+        "inet anf" batch).
+      - Devices default to EXT_IF + INT_IF + DMZ_IF (wildcards expanded),
+        overridable with FASTPATH_DEVICES.
+      - Optional: raise NIC ring buffers on all hardware NICs (or
+        FASTPATH_NIC_RINGS), set the CPU scaling governor, and tune the
+        flowtable TCP/UDP timeouts.
+      - A background job (re)tries building the fastpath once the WAN
+        interface becomes available.

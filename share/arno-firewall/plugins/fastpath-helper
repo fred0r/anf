@@ -1,0 +1,123 @@
+# ------------------------------------------------------------------------------
+#            -= Arno's (NFT) Firewall(ANF) - Flow Offload (fastpath) =-
+#
+# Helper script, run in the background by the ANF job processor. It makes sure
+# the isolated "inet fastpath" table exists once the (WAN) devices configured in
+# firewall.conf are available. It is safe to run repeatedly: the table is only
+# (re)built while it is absent.
+#
+# Target hardware: PC Engines APU2 (see 70fastpath.plugin).
+#
+# Web                   : https://github.com/arno-firewall/anf
+# ------------------------------------------------------------------------------
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# version 2 as published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+# ------------------------------------------------------------------------------
+
+PLUGIN_CONF_FILE="fastpath.conf"
+
+# (State) file storing the fingerprint ("device=ifindex") of the devices in the
+# running fastpath, so a (re)built netdev can be detected
+FASTPATH_STATE="/var/tmp/anf_fastpath_state"
+
+
+fastpath_helper_main()
+{
+  local conf devs ext list iface tmp
+
+  conf=""
+  [ -n "$PLUGIN_CONF_PATH" ] && conf="$PLUGIN_CONF_PATH/$PLUGIN_CONF_FILE"
+
+  if [ ! -f "$conf" ]; then
+    echo "** ERROR: Config file \"$conf\" not found! **" >&2
+    return 1
+  fi
+
+  # Source the plugin config file
+  . "$conf"
+
+  # Only act when enabled
+  [ "$ENABLED" = "1" ] || return 0
+
+  # Determine the flowtable devices
+  if [ -n "$FASTPATH_DEVICES" ]; then
+    devs="$FASTPATH_DEVICES"
+  else
+    # The external (WAN) interface must exist, eg. wait for the ppp device
+    ext="$(wildcard_ifs $EXT_IF 2>/dev/null)"
+    [ -n "$ext" ] || return 0
+    devs="$ext $(wildcard_ifs $INT_IF $DMZ_IF 2>/dev/null)"
+  fi
+
+  # Dedup, and make sure every device currently exists (else defer to a later run)
+  list=""
+  for iface in $devs; do
+    check_interface "$iface" 2>/dev/null || return 0
+    case " $list " in
+      *" $iface "*) ;;
+      *) list="$list${list:+ }$iface" ;;
+    esac
+  done
+  [ -n "$list" ] || return 0
+
+  # Fingerprint of the desired devices ("name=ifindex"), to detect netdevs
+  # that were re-created (eg. bouncing the WAN) or a changed device setup
+  cur=""
+  for iface in $list; do
+    ifi="$(cat "/sys/class/net/$iface/ifindex" 2>/dev/null)"
+    [ -n "$ifi" ] || return 0
+    cur="$cur${cur:+ }$iface=$ifi"
+  done
+
+  # Leave the running fastpath (and its offloaded flows) alone when in sync
+  if $NFT list flowtable inet fastpath >/dev/null 2>&1; then
+    if [ -s "$FASTPATH_STATE" ] && [ "$(cat "$FASTPATH_STATE" 2>/dev/null)" = "$cur" ]; then
+      return 0
+    fi
+
+    # Device set or ifindexes changed: rebuild the fastpath
+    $NFT delete table inet fastpath >/dev/null 2>&1
+  fi
+
+  tmp="$(mktemp)" || return 1
+
+  {
+    echo "table inet fastpath {"
+    echo "  flowtable fastpath {"
+    echo "    hook ingress priority filter"
+    echo "    devices = { $(echo "$list" |sed 's/ /, /g') }"
+    echo "    counter"
+    echo "  }"
+    echo "  chain FASTPATH_CHAIN {"
+    echo "    type filter hook forward priority filter + 1; policy accept;"
+    echo "    ip protocol { tcp, udp } ct state established flow add @fastpath"
+    [ "$IPV6_SUPPORT" = "1" ] && echo "    ip6 nexthdr { tcp, udp } ct state established flow add @fastpath"
+    echo "  }"
+    echo "}"
+  } > "$tmp"
+
+  if $NFT -f "$tmp"; then
+    echo "$cur" > "$FASTPATH_STATE" 2>/dev/null
+    echo "Flow offload fastpath enabled (devices: $(echo "$list" |sed 's/ /, /g'))"
+    rm -f "$tmp"
+    return 0
+  fi
+
+  echo "** ERROR: Failed to load the flowtable fastpath! **" >&2
+  rm -f "$tmp"
+  return 1
+}
+
+
+fastpath_helper_main
+PLUGIN_RET_VAL=$?
