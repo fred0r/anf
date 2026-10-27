@@ -80,31 +80,32 @@ fastpath_helper_main()
   done
 
   # Leave the running fastpath (and its offloaded flows) alone when in sync
-  if $NFT list flowtable inet fastpath >/dev/null 2>&1; then
+  if $NFT list flowtable inet fastpath fp >/dev/null 2>&1; then
     if [ -s "$FASTPATH_STATE" ] && [ "$(cat "$FASTPATH_STATE" 2>/dev/null)" = "$cur" ]; then
       return 0
     fi
-
-    # Device set or ifindexes changed: rebuild the fastpath
-    $NFT delete table inet fastpath >/dev/null 2>&1
   fi
 
   tmp="$(mktemp)" || return 1
 
   {
     echo "table inet fastpath {"
-    echo "  flowtable fastpath {"
+    echo "  flowtable fp {"
     echo "    hook ingress priority filter"
     echo "    devices = { $(echo "$list" |sed 's/ /, /g') }"
     echo "    counter"
     echo "  }"
     echo "  chain FASTPATH_CHAIN {"
     echo "    type filter hook forward priority filter + 1; policy accept;"
-    echo "    ip protocol { tcp, udp } ct state established flow add @fastpath"
-    [ "$IPV6_SUPPORT" = "1" ] && echo "    ip6 nexthdr { tcp, udp } ct state established flow add @fastpath"
+    echo "    ip protocol { tcp, udp } ct state established flow add @fp"
+    [ "$IPV6_SUPPORT" = "1" ] && echo "    ip6 nexthdr { tcp, udp } ct state established flow add @fp"
     echo "  }"
     echo "}"
   } > "$tmp"
+
+  # Device set/ifindexes changed (or first run): rebuild from a clean table,
+  # so a stale entry or a failed existence check can never append rules
+  $NFT delete table inet fastpath >/dev/null 2>&1
 
   if $NFT -f "$tmp"; then
     echo "$cur" > "$FASTPATH_STATE" 2>/dev/null

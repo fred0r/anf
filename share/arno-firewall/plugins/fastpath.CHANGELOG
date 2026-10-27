@@ -3,6 +3,11 @@ Flow Offload (fastpath) plugin
 
 Target hardware: PC Engines APU2.
 
+1.04  - Fix "nft list flowtable" syntax so the running fastpath is detected;
+        previously the table was reloaded on every job run, appending another
+        "flow add @fastpath" rule each time. Rebuild now starts from a clean
+        table.
+
 1.03  - Leave the flowtable TCP/UDP inactivity timeouts at the kernel
         default (30 s); they are now an opt-in override in fastpath.conf.
       - Document how to find the NIC's maximum ring-buffer size with

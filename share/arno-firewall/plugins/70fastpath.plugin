@@ -2,10 +2,10 @@
 #            -= Arno's (NFT) Firewall(ANF) - Flow Offload (fastpath) =-
 #
 PLUGIN_NAME="Flow Offload (fastpath) plugin (PC Engines APU2)"
-PLUGIN_VERSION="1.03"
+PLUGIN_VERSION="1.04"
 PLUGIN_CONF_FILE="fastpath.conf"
 #
-# Last changed          : October 18, 2026
+# Last changed          : October 27, 2026
 # Requirements          : ANF 3.0.0 (or newer)
 # Target hardware       : PC Engines APU2 (AMD GX-412TC quad-core, Intel i211
 #                         "igb" NICs), typically with a PPPoE WAN.
@@ -142,7 +142,7 @@ plugin_status()
 {
   echo "  Flowtable:"
   echo "  =============================="
-  $NFT list flowtable inet fastpath 2>/dev/null
+  $NFT list flowtable inet fastpath fp 2>/dev/null
   echo "  ------------------------------"
   echo "  Offloaded connections: $(grep -c OFFLOAD /proc/net/nf_conntrack 2>/dev/null)"
   echo ""
