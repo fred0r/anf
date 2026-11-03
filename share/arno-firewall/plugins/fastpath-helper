@@ -30,6 +30,72 @@ PLUGIN_CONF_FILE="fastpath.conf"
 # running fastpath, so a (re)built netdev can be detected
 FASTPATH_STATE="/var/tmp/anf_fastpath_state"
 
+# (State) file storing the last seen WAN IPv4 address(es), to detect a change
+FASTPATH_WAN_IP_STATE="/var/tmp/anf_fastpath_wan_ips"
+
+
+# Delete conntrack entries that still use a WAN IPv4 address after it changed,
+# so existing sessions do not keep being translated to the old address
+flush_stale_conntrack_on_wan_change()
+{
+  local iface ifaces ip cur old removed
+
+  [ "$FASTPATH_FLUSH_CONNTRACK" = "1" ] || return 0
+
+  if ! check_command conntrack; then
+    echo "** ERROR: Required command conntrack is not available! **" >&2
+    return 0
+  fi
+
+  # The external (WAN) interface must exist, else keep the recorded addresses
+  ifaces="$(wildcard_ifs $EXT_IF 2>/dev/null)"
+  [ -n "$ifaces" ] || return 0
+
+  # Current WAN IPv4 address(es)
+  cur=""
+  for iface in $ifaces; do
+    for ip in $(get_network_ipv4_address_all "$iface" 2>/dev/null); do
+      case " $cur " in
+        *" $ip "*) ;;
+        *) cur="$cur${cur:+ }$ip" ;;
+      esac
+    done
+  done
+  [ -n "$cur" ] || return 0
+
+  # First run: only remember the current address(es)
+  if [ ! -s "$FASTPATH_WAN_IP_STATE" ]; then
+    echo "$cur" > "$FASTPATH_WAN_IP_STATE" 2>/dev/null
+    return 0
+  fi
+
+  old="$(cat "$FASTPATH_WAN_IP_STATE" 2>/dev/null)"
+
+  # Address(es) that disappeared
+  removed=""
+  for ip in $old; do
+    case " $cur " in
+      *" $ip "*) ;;
+      *) removed="$removed${removed:+ }$ip" ;;
+    esac
+  done
+
+  for ip in $removed; do
+    echo "Flushing conntrack entries for old WAN address $ip"
+    conntrack -D -f ipv4 --orig-src  "$ip" >/dev/null 2>&1
+    conntrack -D -f ipv4 --orig-dst  "$ip" >/dev/null 2>&1
+    conntrack -D -f ipv4 --reply-src "$ip" >/dev/null 2>&1
+    conntrack -D -f ipv4 --reply-dst "$ip" >/dev/null 2>&1
+  done
+
+  # Force a clean fastpath rebuild, so flows offloaded with the old address
+  # are dropped as well (they may otherwise survive until their own timeout)
+  [ -n "$removed" ] && [ -n "$FASTPATH_STATE" ] && rm -f "$FASTPATH_STATE"
+
+  echo "$cur" > "$FASTPATH_WAN_IP_STATE" 2>/dev/null
+  return 0
+}
+
 
 fastpath_helper_main()
 {
@@ -48,6 +114,9 @@ fastpath_helper_main()
 
   # Only act when enabled
   [ "$ENABLED" = "1" ] || return 0
+
+  # Flush conntrack entries bound to a WAN address that has changed
+  flush_stale_conntrack_on_wan_change
 
   # Determine the flowtable devices
   if [ -n "$FASTPATH_DEVICES" ]; then

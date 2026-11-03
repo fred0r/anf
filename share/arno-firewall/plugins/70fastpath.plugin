@@ -2,7 +2,7 @@
 #            -= Arno's (NFT) Firewall(ANF) - Flow Offload (fastpath) =-
 #
 PLUGIN_NAME="Flow Offload (fastpath) plugin (PC Engines APU2)"
-PLUGIN_VERSION="1.04"
+PLUGIN_VERSION="1.05"
 PLUGIN_CONF_FILE="fastpath.conf"
 #
 # Last changed          : October 27, 2026
@@ -12,7 +12,8 @@ PLUGIN_CONF_FILE="fastpath.conf"
 # Comments              : Enable the nftables flowtable fastpath for forwarded
 #                         traffic (in an isolated "inet fastpath" table), and
 #                         optionally tune flowtable timeouts, the CPU scaling
-#                         governor and the NIC ring buffers.
+#                         governor and the NIC ring buffers, and flush stale
+#                         conntrack entries when the WAN address changes.
 #
 # Web                   : https://github.com/arno-firewall/anf
 # ------------------------------------------------------------------------------
@@ -39,6 +40,9 @@ JOB_HELPER_SCRIPT="$PLUGIN_BIN_PATH/fastpath-helper"
 # (State) file storing the fingerprint ("device=ifindex") of the devices in the
 # running fastpath, so a (re)built netdev can be detected
 FASTPATH_STATE="/var/tmp/anf_fastpath_state"
+
+# (State) file storing the last seen WAN IPv4 address(es), to detect a change
+FASTPATH_WAN_IP_STATE="/var/tmp/anf_fastpath_wan_ips"
 
 
 set_flowtable_timeouts()
@@ -104,7 +108,7 @@ plugin_start()
   job_run_once "$JOB_HELPER_SCRIPT" >/dev/null 2>&1
 
   # Keep it in sync (eg. once the WAN interface appears)
-  if ! job_add "$JOB_NAME" 2 "$JOB_HELPER_SCRIPT"; then
+  if ! job_add "$JOB_NAME" 1 "$JOB_HELPER_SCRIPT"; then
     return 1
   fi
 
@@ -129,7 +133,7 @@ plugin_stop()
 
   job_remove "$JOB_NAME" >/dev/null 2>&1
   $NFT delete table inet fastpath 2>/dev/null
-  rm -f "$FASTPATH_STATE"
+  rm -f "$FASTPATH_STATE" "$FASTPATH_WAN_IP_STATE"
 
   echo "done"
 
@@ -144,6 +148,7 @@ plugin_status()
   echo "  =============================="
   $NFT list flowtable inet fastpath fp 2>/dev/null
   echo "  ------------------------------"
+  echo "  Tracked WAN IP(s): $(cat "$FASTPATH_WAN_IP_STATE" 2>/dev/null)"
   echo "  Offloaded connections: $(grep -c OFFLOAD /proc/net/nf_conntrack 2>/dev/null)"
   echo ""
 
@@ -161,6 +166,11 @@ plugin_sanity_check()
 
   if [ -n "$FASTPATH_NIC_RINGS" ] && ! check_command ethtool; then
     printf "\033[40m\033[1;31m${INDENT}ERROR: Required command ethtool is not available!\033[0m\n" >&2
+    return 1
+  fi
+
+  if [ "$FASTPATH_FLUSH_CONNTRACK" = "1" ] && ! check_command conntrack; then
+    printf "\033[40m\033[1;31m${INDENT}ERROR: Required command conntrack is not available!\033[0m\n" >&2
     return 1
   fi
 
