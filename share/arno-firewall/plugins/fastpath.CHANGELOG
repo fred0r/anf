@@ -3,6 +3,17 @@ Flow Offload (fastpath) plugin
 
 Target hardware: PC Engines APU2.
 
+1.06  - Security hardening: state files are created 0600 and replaced
+        atomically, symlinks/FIFOs are never followed, and WAN IPv4s,
+        interface names and numeric settings are validated before use.
+      - Flush the flowtable on a plugin restart (FASTPATH_FLUSH_ON_RESTART),
+        so firewall/blocklist changes apply to established offloaded flows.
+      - WAN IPv4 change detection and the forced rebuild no longer depend on
+        FASTPATH_FLUSH_CONNTRACK; that setting now only controls whether the
+        matching conntrack entries are deleted.
+      - Note: "force-reload" only reloads blocklists and does not restart the
+        plugin; use "restart" to drop offloaded flows.
+
 1.05  - Flush conntrack entries still bound to a WAN IPv4 address after it
         changes (FASTPATH_FLUSH_CONNTRACK), so existing sessions do not keep
         using the old address. The helper now checks once a minute.

@@ -2,10 +2,10 @@
 #            -= Arno's (NFT) Firewall(ANF) - Flow Offload (fastpath) =-
 #
 PLUGIN_NAME="Flow Offload (fastpath) plugin (PC Engines APU2)"
-PLUGIN_VERSION="1.05"
+PLUGIN_VERSION="1.06"
 PLUGIN_CONF_FILE="fastpath.conf"
 #
-# Last changed          : October 27, 2026
+# Last changed          : November 5, 2026
 # Requirements          : ANF 3.0.0 (or newer)
 # Target hardware       : PC Engines APU2 (AMD GX-412TC quad-core, Intel i211
 #                         "igb" NICs), typically with a PPPoE WAN.
@@ -45,10 +45,57 @@ FASTPATH_STATE="/var/tmp/anf_fastpath_state"
 FASTPATH_WAN_IP_STATE="/var/tmp/anf_fastpath_wan_ips"
 
 
+# Only regular files may be used for our state. A symlink (or any other type)
+# is left alone, so it can never redirect a root write somewhere else.
+fastpath_state_safe()
+{
+  local file="$1"
+
+  [ -n "$file" ] || return 1
+  [ -L "$file" ] && return 1
+  [ -e "$file" ] && [ ! -f "$file" ] && return 1
+
+  return 0
+}
+
+
+fastpath_state_read()
+{
+  local file="$1"
+
+  fastpath_state_safe "$file" || return 1
+  [ -f "$file" ] || return 0
+
+  cat "$file" 2>/dev/null
+}
+
+
+fastpath_valid_ifname()
+{
+  case "$1" in
+    ""|*[!A-Za-z0-9_.-]*) return 1 ;;
+  esac
+
+  return 0
+}
+
+
 set_flowtable_timeouts()
 {
-  [ -n "$FASTPATH_TCP_TIMEOUT" ] && sysctl -w "net.netfilter.nf_flowtable_tcp_timeout=$FASTPATH_TCP_TIMEOUT" >/dev/null 2>&1
-  [ -n "$FASTPATH_UDP_TIMEOUT" ] && sysctl -w "net.netfilter.nf_flowtable_udp_timeout=$FASTPATH_UDP_TIMEOUT" >/dev/null 2>&1
+  if [ -n "$FASTPATH_TCP_TIMEOUT" ]; then
+    case "$FASTPATH_TCP_TIMEOUT" in
+      *[!0-9]*) printf '%s\n' "** WARNING: Ignoring invalid FASTPATH_TCP_TIMEOUT setting. **" >&2 ;;
+           *) sysctl -w "net.netfilter.nf_flowtable_tcp_timeout=$FASTPATH_TCP_TIMEOUT" >/dev/null 2>&1 ;;
+    esac
+  fi
+
+  if [ -n "$FASTPATH_UDP_TIMEOUT" ]; then
+    case "$FASTPATH_UDP_TIMEOUT" in
+      *[!0-9]*) printf '%s\n' "** WARNING: Ignoring invalid FASTPATH_UDP_TIMEOUT setting. **" >&2 ;;
+           *) sysctl -w "net.netfilter.nf_flowtable_udp_timeout=$FASTPATH_UDP_TIMEOUT" >/dev/null 2>&1 ;;
+    esac
+  fi
+
   return 0
 }
 
@@ -59,8 +106,13 @@ set_governor()
 
   [ -n "$FASTPATH_GOVERNOR" ] || return 0
 
+  case "$FASTPATH_GOVERNOR" in
+    *[!A-Za-z0-9_-]*) printf '%s\n' "** WARNING: Ignoring invalid FASTPATH_GOVERNOR setting. **" >&2
+                      return 0 ;;
+  esac
+
   for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-    [ -w "$cpu" ] && echo "$FASTPATH_GOVERNOR" > "$cpu" 2>/dev/null
+    [ -w "$cpu" ] && printf '%s\n' "$FASTPATH_GOVERNOR" > "$cpu" 2>/dev/null
   done
   return 0
 }
@@ -69,6 +121,20 @@ set_governor()
 set_nic_rings()
 {
   local ifaces iface
+
+  if [ -z "$FASTPATH_RING_RX" ] || [ -z "$FASTPATH_RING_TX" ]; then
+    return 0
+  fi
+
+  case "$FASTPATH_RING_RX" in
+    *[!0-9]*) printf '%s\n' "** WARNING: Ignoring invalid FASTPATH_RING_RX setting. **" >&2
+              return 0 ;;
+  esac
+
+  case "$FASTPATH_RING_TX" in
+    *[!0-9]*) printf '%s\n' "** WARNING: Ignoring invalid FASTPATH_RING_TX setting. **" >&2
+              return 0 ;;
+  esac
 
   if [ -n "$FASTPATH_NIC_RINGS" ]; then
     ifaces="$FASTPATH_NIC_RINGS"
@@ -85,6 +151,10 @@ set_nic_rings()
   [ -n "$ifaces" ] || return 0
 
   for iface in $ifaces; do
+    fastpath_valid_ifname "$iface" || {
+      printf '%s\n' "** WARNING: Ignoring invalid interface name \"$iface\". **" >&2
+      continue
+    }
     ethtool -G "$iface" rx "$FASTPATH_RING_RX" tx "$FASTPATH_RING_TX" >/dev/null 2>&1
   done
   return 0
@@ -95,9 +165,9 @@ set_nic_rings()
 plugin_start()
 {
   if [ -n "$FASTPATH_NIC_RINGS" ]; then
-    printf "${INDENT}Flow Offload - NIC rings on: $FASTPATH_NIC_RINGS\n"
+    printf '%s\n' "${INDENT}Flow Offload - NIC rings on: $FASTPATH_NIC_RINGS"
   else
-    printf "${INDENT}Flow Offload - NIC rings on all hardware NICs\n"
+    printf '%s\n' "${INDENT}Flow Offload - NIC rings on all hardware NICs"
   fi
 
   set_flowtable_timeouts
@@ -119,6 +189,13 @@ plugin_start()
 # Plugin restart function
 plugin_restart()
 {
+  case "${FASTPATH_FLUSH_ON_RESTART:-1}" in
+    1) "$NFT" delete table inet fastpath 2>/dev/null
+       rm -f "$FASTPATH_STATE" ;;
+    0) ;;
+    *) printf '%s\n' "** WARNING: Invalid FASTPATH_FLUSH_ON_RESTART value, keeping flows. **" >&2 ;;
+  esac
+
   # Skip plugin_stop on a restart
   plugin_start
 
@@ -129,13 +206,13 @@ plugin_restart()
 # Plugin stop function
 plugin_stop()
 {
-  printf "${INDENT}Flow Offload - Stopping... "
+  printf '%s' "${INDENT}Flow Offload - Stopping... "
 
   job_remove "$JOB_NAME" >/dev/null 2>&1
-  $NFT delete table inet fastpath 2>/dev/null
+  "$NFT" delete table inet fastpath 2>/dev/null
   rm -f "$FASTPATH_STATE" "$FASTPATH_WAN_IP_STATE"
 
-  echo "done"
+  printf '%s\n' "done"
 
   return 0
 }
@@ -144,13 +221,13 @@ plugin_stop()
 # Plugin status function
 plugin_status()
 {
-  echo "  Flowtable:"
-  echo "  =============================="
-  $NFT list flowtable inet fastpath fp 2>/dev/null
-  echo "  ------------------------------"
-  echo "  Tracked WAN IP(s): $(cat "$FASTPATH_WAN_IP_STATE" 2>/dev/null)"
-  echo "  Offloaded connections: $(grep -c OFFLOAD /proc/net/nf_conntrack 2>/dev/null)"
-  echo ""
+  printf '%s\n' "  Flowtable:"
+  printf '%s\n' "  =============================="
+  "$NFT" list flowtable inet fastpath fp 2>/dev/null
+  printf '%s\n' "  ------------------------------"
+  printf '%s\n' "  Tracked WAN IP(s): $(fastpath_state_read "$FASTPATH_WAN_IP_STATE")"
+  printf '%s\n' "  Offloaded connections: $(grep -c OFFLOAD /proc/net/nf_conntrack 2>/dev/null)"
+  printf '%s\n' ""
 
   return 0
 }
@@ -164,12 +241,17 @@ plugin_sanity_check()
     return 1
   fi
 
+  if ! check_command mktemp; then
+    printf "\033[40m\033[1;31m${INDENT}ERROR: Required command mktemp is not available!\033[0m\n" >&2
+    return 1
+  fi
+
   if [ -n "$FASTPATH_NIC_RINGS" ] && ! check_command ethtool; then
     printf "\033[40m\033[1;31m${INDENT}ERROR: Required command ethtool is not available!\033[0m\n" >&2
     return 1
   fi
 
-  if [ "$FASTPATH_FLUSH_CONNTRACK" = "1" ] && ! check_command conntrack; then
+  if [ "${FASTPATH_FLUSH_CONNTRACK:-1}" = "1" ] && ! check_command conntrack; then
     printf "\033[40m\033[1;31m${INDENT}ERROR: Required command conntrack is not available!\033[0m\n" >&2
     return 1
   fi
@@ -193,7 +275,8 @@ PLUGIN_RET_VAL=0
 
 # Check if the config file exists
 if [ ! -f "$CONF_FILE" ]; then
-  printf "NOTE: Config file \"$CONF_FILE\" not found!\n        Plugin \"$PLUGIN_NAME v$PLUGIN_VERSION\" ignored!\n" >&2
+  printf '%s\n' "NOTE: Config file \"$CONF_FILE\" not found!" >&2
+  printf '%s\n' "        Plugin \"$PLUGIN_NAME v$PLUGIN_VERSION\" ignored!" >&2
 else
   # Source the plugin config file
   . "$CONF_FILE"

@@ -34,17 +34,91 @@ FASTPATH_STATE="/var/tmp/anf_fastpath_state"
 FASTPATH_WAN_IP_STATE="/var/tmp/anf_fastpath_wan_ips"
 
 
+# Only regular files may be used for our state. A symlink (or any other type)
+# is left alone, so it can never redirect a root write somewhere else.
+fastpath_state_safe()
+{
+  local file="$1"
+
+  [ -n "$file" ] || return 1
+  [ -L "$file" ] && return 1
+  [ -e "$file" ] && [ ! -f "$file" ] && return 1
+
+  return 0
+}
+
+
+fastpath_state_read()
+{
+  local file="$1"
+
+  fastpath_state_safe "$file" || return 1
+  [ -f "$file" ] || return 0
+
+  cat "$file" 2>/dev/null
+}
+
+
+# Write our own state file (0600), replacing a pre-existing regular file
+# atomically. Symlinks/FIFOs are never followed and are left alone.
+fastpath_state_write()
+{
+  local file="$1" value="$2" tmp
+
+  fastpath_state_safe "$file" || return 1
+
+  tmp="$(umask 077; mktemp "${file}.XXXXXX")" || return 1
+  ( umask 077; printf '%s\n' "$value" > "$tmp" ) || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$file" 2>/dev/null || { rm -f "$tmp"; return 1; }
+
+  return 0
+}
+
+
+fastpath_valid_ipv4()
+{
+  case "$1" in
+    ""|*[!0-9.]*|.*|*.|*..*) return 1 ;;
+  esac
+
+  printf '%s\n' "$1" | awk -F. '
+    NF == 4 &&
+    $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ &&
+    $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ &&
+    $1 <= 255 && $2 <= 255 && $3 <= 255 && $4 <= 255 { exit 0 }
+    { exit 1 }'
+}
+
+
+fastpath_valid_ifname()
+{
+  case "$1" in
+    ""|*[!A-Za-z0-9_.-]*) return 1 ;;
+  esac
+
+  return 0
+}
+
+
 # Delete conntrack entries that still use a WAN IPv4 address after it changed,
-# so existing sessions do not keep being translated to the old address
+# so existing sessions do not keep being translated to the old address. The
+# detection itself is independent of FASTPATH_FLUSH_CONNTRACK, so a WAN address
+# change always forces a flowtable rebuild.
 flush_stale_conntrack_on_wan_change()
 {
-  local iface ifaces ip cur old removed
+  local iface ifaces ip cur old removed do_flush
 
-  [ "$FASTPATH_FLUSH_CONNTRACK" = "1" ] || return 0
+  do_flush=0
+  case "${FASTPATH_FLUSH_CONNTRACK:-1}" in
+    1) do_flush=1 ;;
+    0) do_flush=0 ;;
+    *) printf '%s\n' "** WARNING: Invalid FASTPATH_FLUSH_CONNTRACK value, conntrack flush disabled. **" >&2 ;;
+  esac
 
-  if ! check_command conntrack; then
-    echo "** ERROR: Required command conntrack is not available! **" >&2
-    return 0
+  if [ "$do_flush" = "1" ] && ! check_command conntrack; then
+    printf '%s\n' "** ERROR: Required command conntrack is not available! **" >&2
+    do_flush=0
   fi
 
   # The external (WAN) interface must exist, else keep the recorded addresses
@@ -54,7 +128,9 @@ flush_stale_conntrack_on_wan_change()
   # Current WAN IPv4 address(es)
   cur=""
   for iface in $ifaces; do
+    fastpath_valid_ifname "$iface" || continue
     for ip in $(get_network_ipv4_address_all "$iface" 2>/dev/null); do
+      fastpath_valid_ipv4 "$ip" || continue
       case " $cur " in
         *" $ip "*) ;;
         *) cur="$cur${cur:+ }$ip" ;;
@@ -63,49 +139,62 @@ flush_stale_conntrack_on_wan_change()
   done
   [ -n "$cur" ] || return 0
 
-  # First run: only remember the current address(es)
-  if [ ! -s "$FASTPATH_WAN_IP_STATE" ]; then
-    echo "$cur" > "$FASTPATH_WAN_IP_STATE" 2>/dev/null
+  if ! fastpath_state_safe "$FASTPATH_WAN_IP_STATE"; then
+    printf '%s\n' "** WARNING: Refusing to use unsafe state file \"$FASTPATH_WAN_IP_STATE\". **" >&2
     return 0
   fi
 
-  old="$(cat "$FASTPATH_WAN_IP_STATE" 2>/dev/null)"
+  old="$(fastpath_state_read "$FASTPATH_WAN_IP_STATE")"
+
+  # First run: only remember the current address(es)
+  if [ -z "$old" ]; then
+    fastpath_state_write "$FASTPATH_WAN_IP_STATE" "$cur" || \
+      printf '%s\n' "** WARNING: Failed to write state file \"$FASTPATH_WAN_IP_STATE\". **" >&2
+    return 0
+  fi
 
   # Address(es) that disappeared
   removed=""
   for ip in $old; do
+    fastpath_valid_ipv4 "$ip" || continue
     case " $cur " in
       *" $ip "*) ;;
       *) removed="$removed${removed:+ }$ip" ;;
     esac
   done
 
-  for ip in $removed; do
-    echo "Flushing conntrack entries for old WAN address $ip"
-    conntrack -D -f ipv4 --orig-src  "$ip" >/dev/null 2>&1
-    conntrack -D -f ipv4 --orig-dst  "$ip" >/dev/null 2>&1
-    conntrack -D -f ipv4 --reply-src "$ip" >/dev/null 2>&1
-    conntrack -D -f ipv4 --reply-dst "$ip" >/dev/null 2>&1
-  done
+  if [ -n "$removed" ]; then
+    if [ "$do_flush" = "1" ]; then
+      for ip in $removed; do
+        printf '%s\n' "Flushing conntrack entries for old WAN address $ip"
+        conntrack -D -f ipv4 --orig-src  "$ip" >/dev/null 2>&1
+        conntrack -D -f ipv4 --orig-dst  "$ip" >/dev/null 2>&1
+        conntrack -D -f ipv4 --reply-src "$ip" >/dev/null 2>&1
+        conntrack -D -f ipv4 --reply-dst "$ip" >/dev/null 2>&1
+      done
+    fi
 
-  # Force a clean fastpath rebuild, so flows offloaded with the old address
-  # are dropped as well (they may otherwise survive until their own timeout)
-  [ -n "$removed" ] && [ -n "$FASTPATH_STATE" ] && rm -f "$FASTPATH_STATE"
+    # Force a clean fastpath rebuild, so flows offloaded with the old address
+    # are dropped as well (they may otherwise survive until their own timeout)
+    rm -f "$FASTPATH_STATE"
+  fi
 
-  echo "$cur" > "$FASTPATH_WAN_IP_STATE" 2>/dev/null
+  fastpath_state_write "$FASTPATH_WAN_IP_STATE" "$cur" || \
+    printf '%s\n' "** WARNING: Failed to write state file \"$FASTPATH_WAN_IP_STATE\". **" >&2
+
   return 0
 }
 
 
 fastpath_helper_main()
 {
-  local conf devs ext list iface tmp
+  local conf devs ext list iface tmp ifi cur devices
 
   conf=""
   [ -n "$PLUGIN_CONF_PATH" ] && conf="$PLUGIN_CONF_PATH/$PLUGIN_CONF_FILE"
 
   if [ ! -f "$conf" ]; then
-    echo "** ERROR: Config file \"$conf\" not found! **" >&2
+    printf '%s\n' "** ERROR: Config file \"$conf\" not found! **" >&2
     return 1
   fi
 
@@ -113,9 +202,17 @@ fastpath_helper_main()
   . "$conf"
 
   # Only act when enabled
-  [ "$ENABLED" = "1" ] || return 0
+  [ "${ENABLED:-0}" = "1" ] || return 0
 
-  # Flush conntrack entries bound to a WAN address that has changed
+  # Refuse unsafe state up front, so a planted symlink/FIFO cannot make us
+  # rebuild the flowtable on every run (and cannot redirect our writes)
+  if ! fastpath_state_safe "$FASTPATH_STATE"; then
+    printf '%s\n' "** WARNING: Refusing to use unsafe state file \"$FASTPATH_STATE\". **" >&2
+    return 1
+  fi
+
+  # Flush conntrack entries bound to a WAN address that has changed (and force
+  # a rebuild), independent of whether the conntrack flush itself is enabled
   flush_stale_conntrack_on_wan_change
 
   # Determine the flowtable devices
@@ -131,6 +228,10 @@ fastpath_helper_main()
   # Dedup, and make sure every device currently exists (else defer to a later run)
   list=""
   for iface in $devs; do
+    if ! fastpath_valid_ifname "$iface"; then
+      printf '%s\n' "** WARNING: Ignoring invalid interface name \"$iface\". **" >&2
+      continue
+    fi
     check_interface "$iface" 2>/dev/null || return 0
     case " $list " in
       *" $iface "*) ;;
@@ -149,41 +250,45 @@ fastpath_helper_main()
   done
 
   # Leave the running fastpath (and its offloaded flows) alone when in sync
-  if $NFT list flowtable inet fastpath fp >/dev/null 2>&1; then
-    if [ -s "$FASTPATH_STATE" ] && [ "$(cat "$FASTPATH_STATE" 2>/dev/null)" = "$cur" ]; then
+  if "$NFT" list flowtable inet fastpath fp >/dev/null 2>&1; then
+    if [ -s "$FASTPATH_STATE" ] && [ ! -L "$FASTPATH_STATE" ] &&
+       [ "$(fastpath_state_read "$FASTPATH_STATE")" = "$cur" ]; then
       return 0
     fi
   fi
 
-  tmp="$(mktemp)" || return 1
+  tmp="$(umask 077; mktemp /var/tmp/anf_fastpath_nft.XXXXXX)" || return 1
+
+  devices="$(printf '%s' "$list" | sed 's/ /, /g')"
 
   {
-    echo "table inet fastpath {"
-    echo "  flowtable fp {"
-    echo "    hook ingress priority filter"
-    echo "    devices = { $(echo "$list" |sed 's/ /, /g') }"
-    echo "    counter"
-    echo "  }"
-    echo "  chain FASTPATH_CHAIN {"
-    echo "    type filter hook forward priority filter + 1; policy accept;"
-    echo "    ip protocol { tcp, udp } ct state established flow add @fp"
-    [ "$IPV6_SUPPORT" = "1" ] && echo "    ip6 nexthdr { tcp, udp } ct state established flow add @fp"
-    echo "  }"
-    echo "}"
+    printf '%s\n' "table inet fastpath {"
+    printf '%s\n' "  flowtable fp {"
+    printf '%s\n' "    hook ingress priority filter"
+    printf '%s\n' "    devices = { $devices }"
+    printf '%s\n' "    counter"
+    printf '%s\n' "  }"
+    printf '%s\n' "  chain FASTPATH_CHAIN {"
+    printf '%s\n' "    type filter hook forward priority filter + 1; policy accept;"
+    printf '%s\n' "    ip protocol { tcp, udp } ct state established flow add @fp"
+    [ "${IPV6_SUPPORT:-0}" = "1" ] && printf '%s\n' "    ip6 nexthdr { tcp, udp } ct state established flow add @fp"
+    printf '%s\n' "  }"
+    printf '%s\n' "}"
   } > "$tmp"
 
   # Device set/ifindexes changed (or first run): rebuild from a clean table,
   # so a stale entry or a failed existence check can never append rules
-  $NFT delete table inet fastpath >/dev/null 2>&1
+  "$NFT" delete table inet fastpath >/dev/null 2>&1
 
-  if $NFT -f "$tmp"; then
-    echo "$cur" > "$FASTPATH_STATE" 2>/dev/null
-    echo "Flow offload fastpath enabled (devices: $(echo "$list" |sed 's/ /, /g'))"
+  if "$NFT" -f "$tmp"; then
+    fastpath_state_write "$FASTPATH_STATE" "$cur" || \
+      printf '%s\n' "** WARNING: Failed to write state file \"$FASTPATH_STATE\". **" >&2
+    printf '%s\n' "Flow offload fastpath enabled (devices: $devices)"
     rm -f "$tmp"
     return 0
   fi
 
-  echo "** ERROR: Failed to load the flowtable fastpath! **" >&2
+  printf '%s\n' "** ERROR: Failed to load the flowtable fastpath! **" >&2
   rm -f "$tmp"
   return 1
 }
