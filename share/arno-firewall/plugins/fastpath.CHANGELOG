@@ -3,6 +3,13 @@ Flow Offload (fastpath) plugin
 
 Target hardware: PC Engines APU2.
 
+1.07  - Detect global WAN IPv6 address changes when IPV6_SUPPORT=1, flush
+        stale IPv6 conntrack entries (FASTPATH_FLUSH_CONNTRACK) and force a
+        flowtable rebuild. Link-local addresses are ignored; temporary and
+        deprecated global addresses are tracked. The flowtable is rebuilt as
+        a whole, so an IPv6 change also resets IPv4 offloaded flows (normally
+        an acceptable trade-off, eg. on a 24h ppp reconnect).
+
 1.06  - Security hardening: state files are created 0600 and replaced
         atomically, symlinks/FIFOs are never followed, and WAN IPv4s,
         interface names and numeric settings are validated before use.

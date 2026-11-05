@@ -2,7 +2,7 @@
 #            -= Arno's (NFT) Firewall(ANF) - Flow Offload (fastpath) =-
 #
 PLUGIN_NAME="Flow Offload (fastpath) plugin (PC Engines APU2)"
-PLUGIN_VERSION="1.06"
+PLUGIN_VERSION="1.07"
 PLUGIN_CONF_FILE="fastpath.conf"
 #
 # Last changed          : November 5, 2026
@@ -43,6 +43,10 @@ FASTPATH_STATE="/var/tmp/anf_fastpath_state"
 
 # (State) file storing the last seen WAN IPv4 address(es), to detect a change
 FASTPATH_WAN_IP_STATE="/var/tmp/anf_fastpath_wan_ips"
+
+# (State) file storing the last seen global WAN IPv6 address(es), to detect a
+# change (only used when IPV6_SUPPORT=1)
+FASTPATH_WAN_IP6_STATE="/var/tmp/anf_fastpath_wan_ip6s"
 
 
 # Only regular files may be used for our state. A symlink (or any other type)
@@ -210,7 +214,7 @@ plugin_stop()
 
   job_remove "$JOB_NAME" >/dev/null 2>&1
   "$NFT" delete table inet fastpath 2>/dev/null
-  rm -f "$FASTPATH_STATE" "$FASTPATH_WAN_IP_STATE"
+  rm -f "$FASTPATH_STATE" "$FASTPATH_WAN_IP_STATE" "$FASTPATH_WAN_IP6_STATE"
 
   printf '%s\n' "done"
 
@@ -225,7 +229,10 @@ plugin_status()
   printf '%s\n' "  =============================="
   "$NFT" list flowtable inet fastpath fp 2>/dev/null
   printf '%s\n' "  ------------------------------"
-  printf '%s\n' "  Tracked WAN IP(s): $(fastpath_state_read "$FASTPATH_WAN_IP_STATE")"
+  printf '%s\n' "  Tracked WAN IPv4(s): $(fastpath_state_read "$FASTPATH_WAN_IP_STATE")"
+  if [ "${IPV6_SUPPORT:-0}" = "1" ]; then
+    printf '%s\n' "  Tracked WAN IPv6(s): $(fastpath_state_read "$FASTPATH_WAN_IP6_STATE")"
+  fi
   printf '%s\n' "  Offloaded connections: $(grep -c OFFLOAD /proc/net/nf_conntrack 2>/dev/null)"
   printf '%s\n' ""
 

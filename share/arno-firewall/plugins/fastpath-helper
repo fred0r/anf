@@ -33,6 +33,10 @@ FASTPATH_STATE="/var/tmp/anf_fastpath_state"
 # (State) file storing the last seen WAN IPv4 address(es), to detect a change
 FASTPATH_WAN_IP_STATE="/var/tmp/anf_fastpath_wan_ips"
 
+# (State) file storing the last seen global WAN IPv6 address(es), to detect a
+# change (only used when IPV6_SUPPORT=1)
+FASTPATH_WAN_IP6_STATE="/var/tmp/anf_fastpath_wan_ip6s"
+
 
 # Only regular files may be used for our state. A symlink (or any other type)
 # is left alone, so it can never redirect a root write somewhere else.
@@ -101,13 +105,104 @@ fastpath_valid_ifname()
 }
 
 
-# Delete conntrack entries that still use a WAN IPv4 address after it changed,
-# so existing sessions do not keep being translated to the old address. The
-# detection itself is independent of FASTPATH_FLUSH_CONNTRACK, so a WAN address
-# change always forces a flowtable rebuild.
+fastpath_valid_ipv6()
+{
+  case "$1" in
+    ""|*[!0-9A-Fa-f:.]*) return 1 ;;
+    *:*) return 0 ;;
+  esac
+
+  return 1
+}
+
+
+# All scope-global IPv6 addresses of an interface. The awk check repeats the
+# scope filter so a link-local address can never slip through.
+fastpath_get_wan_ipv6()
+{
+  ip -6 -o addr show dev "$1" scope global 2>/dev/null \
+    | awk '$3 == "inet6" && $5 == "scope" && $6 == "global" { print $4 }' \
+    | cut -f1 -d'/' | tr '\n' ' ' | sed 's/ $//'
+}
+
+
+# Delete conntrack entries that still use a WAN address after it changed, so
+# existing sessions do not keep being translated to the old address. Detection
+# is independent of FASTPATH_FLUSH_CONNTRACK, so a WAN address change always
+# forces a flowtable rebuild.
+fastpath_flush_family()
+{
+  local family="$1" state_file="$2" address_func="$3" validate_func="$4" do_flush="$5"
+  local iface ifaces ip cur old removed
+
+  # The external (WAN) interface must exist, else keep the recorded addresses
+  ifaces="$(wildcard_ifs $EXT_IF 2>/dev/null)"
+  [ -n "$ifaces" ] || return 0
+
+  # Current WAN address(es)
+  cur=""
+  for iface in $ifaces; do
+    fastpath_valid_ifname "$iface" || continue
+    for ip in $("$address_func" "$iface" 2>/dev/null); do
+      "$validate_func" "$ip" || continue
+      case " $cur " in
+        *" $ip "*) ;;
+        *) cur="$cur${cur:+ }$ip" ;;
+      esac
+    done
+  done
+  [ -n "$cur" ] || return 0
+
+  if ! fastpath_state_safe "$state_file"; then
+    printf '%s\n' "** WARNING: Refusing to use unsafe state file \"$state_file\". **" >&2
+    return 0
+  fi
+
+  old="$(fastpath_state_read "$state_file")"
+
+  # First run: only remember the current address(es)
+  if [ -z "$old" ]; then
+    fastpath_state_write "$state_file" "$cur" || \
+      printf '%s\n' "** WARNING: Failed to write state file \"$state_file\". **" >&2
+    return 0
+  fi
+
+  # Address(es) that disappeared
+  removed=""
+  for ip in $old; do
+    "$validate_func" "$ip" || continue
+    case " $cur " in
+      *" $ip "*) ;;
+      *) removed="$removed${removed:+ }$ip" ;;
+    esac
+  done
+
+  if [ -n "$removed" ]; then
+    if [ "$do_flush" = "1" ]; then
+      for ip in $removed; do
+        printf '%s\n' "Flushing conntrack entries for old WAN $family address $ip"
+        conntrack -D -f "$family" --orig-src  "$ip" >/dev/null 2>&1
+        conntrack -D -f "$family" --orig-dst  "$ip" >/dev/null 2>&1
+        conntrack -D -f "$family" --reply-src "$ip" >/dev/null 2>&1
+        conntrack -D -f "$family" --reply-dst "$ip" >/dev/null 2>&1
+      done
+    fi
+
+    # Force a clean fastpath rebuild, so flows offloaded with the old address
+    # are dropped as well (they may otherwise survive until their own timeout)
+    rm -f "$FASTPATH_STATE"
+  fi
+
+  fastpath_state_write "$state_file" "$cur" || \
+    printf '%s\n' "** WARNING: Failed to write state file \"$state_file\". **" >&2
+
+  return 0
+}
+
+
 flush_stale_conntrack_on_wan_change()
 {
-  local iface ifaces ip cur old removed do_flush
+  local do_flush
 
   do_flush=0
   case "${FASTPATH_FLUSH_CONNTRACK:-1}" in
@@ -121,66 +216,13 @@ flush_stale_conntrack_on_wan_change()
     do_flush=0
   fi
 
-  # The external (WAN) interface must exist, else keep the recorded addresses
-  ifaces="$(wildcard_ifs $EXT_IF 2>/dev/null)"
-  [ -n "$ifaces" ] || return 0
+  fastpath_flush_family ipv4 "$FASTPATH_WAN_IP_STATE" \
+    get_network_ipv4_address_all fastpath_valid_ipv4 "$do_flush"
 
-  # Current WAN IPv4 address(es)
-  cur=""
-  for iface in $ifaces; do
-    fastpath_valid_ifname "$iface" || continue
-    for ip in $(get_network_ipv4_address_all "$iface" 2>/dev/null); do
-      fastpath_valid_ipv4 "$ip" || continue
-      case " $cur " in
-        *" $ip "*) ;;
-        *) cur="$cur${cur:+ }$ip" ;;
-      esac
-    done
-  done
-  [ -n "$cur" ] || return 0
-
-  if ! fastpath_state_safe "$FASTPATH_WAN_IP_STATE"; then
-    printf '%s\n' "** WARNING: Refusing to use unsafe state file \"$FASTPATH_WAN_IP_STATE\". **" >&2
-    return 0
+  if [ "${IPV6_SUPPORT:-0}" = "1" ]; then
+    fastpath_flush_family ipv6 "$FASTPATH_WAN_IP6_STATE" \
+      fastpath_get_wan_ipv6 fastpath_valid_ipv6 "$do_flush"
   fi
-
-  old="$(fastpath_state_read "$FASTPATH_WAN_IP_STATE")"
-
-  # First run: only remember the current address(es)
-  if [ -z "$old" ]; then
-    fastpath_state_write "$FASTPATH_WAN_IP_STATE" "$cur" || \
-      printf '%s\n' "** WARNING: Failed to write state file \"$FASTPATH_WAN_IP_STATE\". **" >&2
-    return 0
-  fi
-
-  # Address(es) that disappeared
-  removed=""
-  for ip in $old; do
-    fastpath_valid_ipv4 "$ip" || continue
-    case " $cur " in
-      *" $ip "*) ;;
-      *) removed="$removed${removed:+ }$ip" ;;
-    esac
-  done
-
-  if [ -n "$removed" ]; then
-    if [ "$do_flush" = "1" ]; then
-      for ip in $removed; do
-        printf '%s\n' "Flushing conntrack entries for old WAN address $ip"
-        conntrack -D -f ipv4 --orig-src  "$ip" >/dev/null 2>&1
-        conntrack -D -f ipv4 --orig-dst  "$ip" >/dev/null 2>&1
-        conntrack -D -f ipv4 --reply-src "$ip" >/dev/null 2>&1
-        conntrack -D -f ipv4 --reply-dst "$ip" >/dev/null 2>&1
-      done
-    fi
-
-    # Force a clean fastpath rebuild, so flows offloaded with the old address
-    # are dropped as well (they may otherwise survive until their own timeout)
-    rm -f "$FASTPATH_STATE"
-  fi
-
-  fastpath_state_write "$FASTPATH_WAN_IP_STATE" "$cur" || \
-    printf '%s\n' "** WARNING: Failed to write state file \"$FASTPATH_WAN_IP_STATE\". **" >&2
 
   return 0
 }
