@@ -829,6 +829,14 @@ copy_skip_if_exist ./etc/arno-firewall/custom-rules /etc/arno-firewall/
 mkdir -pv /etc/arno-firewall/plugins || exit 1
 copy_ask_if_exist ./etc/arno-firewall/plugins/ /etc/arno-firewall/plugins/ "n" "old" "dist"
 
+# The portknock sequence is a shared secret: keep its config (and any
+# backup/merge copies) root-only
+for PN_CONF in /etc/arno-firewall/plugins/portknock.conf*; do
+  if [ -f "$PN_CONF" ]; then
+    chmod 600 "$PN_CONF"
+  fi
+done
+
 mkdir -pv /etc/arno-firewall/conf.d || exit 1
 echo "Files with a .conf extension in this directory will be sourced by the environment file" >/etc/arno-firewall/conf.d/README
 

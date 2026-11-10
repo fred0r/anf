@@ -1,0 +1,1755 @@
+# ------------------------------------------------------------------------------
+#            -= Arno's (NFT) Firewall(ANF) - Port Knocking plugin =-
+#
+PLUGIN_NAME="Port Knocking plugin"
+PLUGIN_VERSION="1.0"
+PLUGIN_CONF_FILE="portknock.conf"
+#
+# Last changed          : November 10, 2026
+# Requirements          : ANF 3.0.0 (or newer)
+# Comments              : Open configured TCP/UDP ports on this firewall host
+#                         for a limited time after a configured sequence of
+#                         knocks (TCP SYN or UDP packets). Implemented entirely
+#                         in nftables (dynamic sets with timeouts): no daemon
+#                         and no log parsing. Inspired by knockd.
+#
+# Web                   : https://github.com/arno-firewall/anf
+# ------------------------------------------------------------------------------
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# version 2 as published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+# ------------------------------------------------------------------------------
+
+# Parse a PROTO/PORT (or just PORT, meaning tcp) item.
+# On success sets PK_PROTO and PK_PORT.
+portknock_parse_item()
+{
+  local item="$1" proto port
+
+  case "$item" in
+    */*) proto="${item%%/*}"; port="${item#*/}" ;;
+      *) proto="tcp"; port="$item" ;;
+  esac
+
+  case "$proto" in
+    tcp|udp) ;;
+    *) return 1 ;;
+  esac
+
+  case "$port" in
+    ""|*[!0-9]*) return 1 ;;
+  esac
+
+  # Normalize leading zeroes, so arithmetic below is safe
+  while [ "${port#0}" != "$port" ] && [ ${#port} -gt 1 ]; do
+    port="${port#0}"
+  done
+
+  [ "$port" -ge 1 ] 2>/dev/null || return 1
+  [ "$port" -le 65535 ] 2>/dev/null || return 1
+
+  PK_PROTO="$proto"
+  PK_PORT="$port"
+
+  return 0
+}
+
+
+portknock_require_uint()
+{
+  local name="$1" val="$2"
+
+  case "$val" in
+    ""|*[!0-9]*) printf '%s\n' "** ERROR: $name must be a positive integer. **" >&2
+                 return 1 ;;
+  esac
+
+  while [ "${val#0}" != "$val" ] && [ ${#val} -gt 1 ]; do
+    val="${val#0}"
+  done
+
+  if ! [ "$val" -gt 0 ] 2>/dev/null; then
+    printf '%s\n' "** ERROR: $name must be a positive integer. **" >&2
+    return 1
+  fi
+
+  return 0
+}
+
+
+portknock_norm_uint()
+{
+  local val="$1"
+
+  while [ "${val#0}" != "$val" ] && [ ${#val} -gt 1 ]; do
+    val="${val#0}"
+  done
+
+  printf '%s' "$val"
+}
+
+
+portknock_port_match()
+{
+  local port list item start end
+  local IFS=', '
+
+  port="$(portknock_norm_uint "$1")"
+  list="$2"
+
+  for item in $list; do
+    [ -n "$item" ] || continue
+    case "$item" in
+      *-*|*:*)
+        start="${item%%-*}"
+        end="${item#*-}"
+        case "$item" in
+          *:*) start="${item%%:*}"; end="${item#*:}" ;;
+        esac
+        start="$(portknock_norm_uint "$start")"
+        end="$(portknock_norm_uint "$end")"
+        [ "$port" -ge "$start" ] 2>/dev/null && [ "$port" -le "$end" ] 2>/dev/null && return 0
+        ;;
+      *)
+        item="$(portknock_norm_uint "$item")"
+        [ "$port" = "$item" ] && return 0
+        ;;
+    esac
+  done
+
+  return 1
+}
+
+
+portknock_iface_match()
+{
+  local rule_ifs="$1" kif="$2" rif prefix kprefix
+  local IFS=', '
+
+  case "$kif" in ""|+) return 0 ;; esac
+  case "$rule_ifs" in ""|+) return 0 ;; esac
+
+  for rif in $rule_ifs; do
+    [ -n "$rif" ] || continue
+    case "$rif" in
+      *+)
+        prefix="${rif%+}"
+        case "$kif" in
+          *+)
+            kprefix="${kif%+}"
+            case "$kprefix" in "$prefix"*) return 0 ;; esac
+            case "$prefix" in "$kprefix"*) return 0 ;; esac
+            ;;
+          *)
+            case "$kif" in "$prefix"*) return 0 ;; esac
+            ;;
+        esac
+        ;;
+      *)
+        case "$kif" in
+          *+)
+            kprefix="${kif%+}"
+            case "$rif" in "$kprefix"*) return 0 ;; esac
+            ;;
+          *)
+            [ "$rif" = "$kif" ] && return 0
+            ;;
+        esac
+        ;;
+    esac
+  done
+
+  return 1
+}
+
+
+portknock_valid_ifname()
+{
+  case "$1" in
+    ""|*[!A-Za-z0-9_.+-]*) return 1 ;;
+  esac
+
+  return 0
+}
+
+
+portknock_validate_interfaces()
+{
+  local kif ext
+  local IFS=' ,'
+
+  ext="${EXT_IF:-}"
+  if [ -z "$ext" ]; then
+    printf '%s\n' "** ERROR: EXT_IF is empty; portknock needs at least one external interface. **" >&2
+    return 1
+  fi
+
+  [ -n "${PORTKNOCK_INTERFACE:-}" ] || return 0
+
+  for kif in $PORTKNOCK_INTERFACE; do
+    [ -n "$kif" ] || continue
+    if ! portknock_valid_ifname "$kif"; then
+      printf '%s\n' "** ERROR: Invalid PORTKNOCK_INTERFACE name \"$kif\". **" >&2
+      return 1
+    fi
+    if ! portknock_iface_match "$ext" "$kif"; then
+      printf '%s\n' "** ERROR: PORTKNOCK_INTERFACE \"$kif\" is not part of EXT_IF (\"$ext\"). **" >&2
+      return 1
+    fi
+  done
+
+  return 0
+}
+
+
+portknock_ipv4_in_prefix()
+{
+  local addr="$1" net="$2" plen="$3"
+
+  case "$plen" in
+    ""|*[!0-9]*) return 1 ;;
+  esac
+  [ "$plen" -ge 0 ] 2>/dev/null && [ "$plen" -le 32 ] 2>/dev/null || return 1
+
+  awk -v a="$addr" -v n="$net" -v p="$plen" 'BEGIN {
+    na = split(a, A, ".");
+    nn = split(n, N, ".");
+    if (na != 4 || nn != 4) exit 1;
+    for (i = 1; i <= 4; i++) {
+      if (A[i] !~ /^[0-9]+$/ || N[i] !~ /^[0-9]+$/) exit 1;
+      if (A[i] < 0 || A[i] > 255 || N[i] < 0 || N[i] > 255) exit 1;
+    }
+    ai = A[1]*16777216 + A[2]*65536 + A[3]*256 + A[4];
+    ni = N[1]*16777216 + N[2]*65536 + N[3]*256 + N[4];
+    block = 2^(32-p);
+    if (block < 1) block = 1;
+    if (int(ai/block) == int(ni/block)) exit 0;
+    exit 1;
+  }'
+}
+
+
+portknock_ipv6_expand()
+{
+  awk -v addr="$1" 'BEGIN {
+    s = tolower(addr);
+    sub(/%.*/, "", s);
+    gsub(/[\[\]]/, "", s);
+
+    if (s ~ /\./) {
+      n = split(s, P, ":");
+      last = P[n];
+      if (last ~ /\./) {
+        m = split(last, O, ".");
+        if (m != 4) exit 1;
+        for (k = 1; k <= 4; k++) {
+          if (O[k] !~ /^[0-9]+$/ || O[k] < 0 || O[k] > 255) exit 1;
+        }
+        h1 = O[1]*256 + O[2];
+        h2 = O[3]*256 + O[4];
+        pre = "";
+        for (k = 1; k < n; k++) pre = pre P[k] ":";
+        s = pre sprintf("%x:%x", h1, h2);
+      }
+    }
+
+    if (s ~ /::/) {
+      if (s ~ /::.*::/) exit 1;
+      split(s, D, "::");
+      left = D[1];
+      right = D[2];
+      nl = (left == "" ? 0 : split(left, L, ":"));
+      nr = (right == "" ? 0 : split(right, R, ":"));
+      miss = 8 - nl - nr;
+      if (miss < 1) exit 1;
+      out = "";
+      for (k = 1; k <= nl; k++) out = out (out == "" ? "" : ":") L[k];
+      for (k = 1; k <= miss; k++) out = out (out == "" ? "" : ":") "0";
+      for (k = 1; k <= nr; k++) out = out (out == "" ? "" : ":") R[k];
+      s = out;
+    }
+
+    ng = split(s, G, ":");
+    if (ng != 8) exit 1;
+    out = "";
+    for (k = 1; k <= 8; k++) {
+      g = G[k];
+      if (g !~ /^[0-9a-f]+$/ || length(g) > 4) exit 1;
+      v = 0;
+      for (j = 1; j <= length(g); j++) {
+        v = v * 16 + index("0123456789abcdef", substr(g, j, 1)) - 1;
+      }
+      out = out (k > 1 ? " " : "") v;
+    }
+    print out;
+  }'
+}
+
+
+portknock_ipv6_in_prefix()
+{
+  local addr="$1" net="$2" plen="$3" a n
+
+  case "$plen" in
+    ""|*[!0-9]*) return 1 ;;
+  esac
+  [ "$plen" -ge 0 ] 2>/dev/null && [ "$plen" -le 128 ] 2>/dev/null || return 1
+
+  a="$(portknock_ipv6_expand "$addr")" || return 1
+  n="$(portknock_ipv6_expand "$net")" || return 1
+
+  awk -v a="$a" -v n="$n" -v p="$plen" 'BEGIN {
+    na = split(a, A, " ");
+    nn = split(n, N, " ");
+    if (na != 8 || nn != 8) exit 1;
+    full = int(p / 16);
+    rem = p % 16;
+    for (i = 1; i <= full; i++) if ((A[i] + 0) != (N[i] + 0)) exit 1;
+    if (rem > 0) {
+      div = 2 ^ (16 - rem);
+      if (int((A[full + 1] + 0) / div) != int((N[full + 1] + 0) / div)) exit 1;
+    }
+    exit 0;
+  }'
+}
+
+
+portknock_dest_match()
+{
+  local kif="$1" dests="$2" dip net plen addr aip resolved addrs
+  local IFS=', '
+
+  case "$dests" in
+    ""|0/0|"${ANYHOST:-0/0}") return 0 ;;
+    ::/0)
+      [ "${IPV6_SUPPORT:-0}" = "1" ] || return 1
+      return 0
+      ;;
+  esac
+
+  case "$kif" in
+    *+)
+      resolved="$(wildcard_ifs "$kif" 2>/dev/null)"
+      [ -n "$resolved" ] || resolved="$kif"
+      ;;
+    *)
+      resolved="$kif"
+      ;;
+  esac
+
+  addrs=""
+  for addr in $resolved; do
+    addrs="$addrs $(ip -o addr show dev "$addr" 2>/dev/null | awk '{ print $4 }' | tr '\n' ' ')"
+  done
+  addrs="${addrs# }"
+
+  if [ -z "$addrs" ]; then
+    printf '%s\n' "** WARNING: Cannot verify destination-specific rule for \"$kif\"; no interface address found. **" >&2
+    return 1
+  fi
+
+  for dip in $dests; do
+    case "$dip" in
+      ""|0/0|"${ANYHOST:-0/0}") return 0 ;;
+      ::/0)
+        [ "${IPV6_SUPPORT:-0}" = "1" ] || continue
+        return 0
+        ;;
+      *:*)
+        case "$dip" in
+          */*) net="${dip%%/*}"; plen="${dip#*/}" ;;
+          *)   net="$dip"; plen=128 ;;
+        esac
+        if ! portknock_ipv6_expand "$net" >/dev/null 2>&1; then
+          printf '%s\n' "** WARNING: Cannot verify IPv6 destination \"$dip\" for \"$kif\"; please check manually. **" >&2
+          continue
+        fi
+        for addr in $addrs; do
+          case "$addr" in
+            *:*) ;;
+            *) continue ;;
+          esac
+          aip="${addr%%/*}"
+          if portknock_ipv6_in_prefix "$aip" "$net" "$plen"; then
+            return 0
+          fi
+        done
+        ;;
+      *)
+        case "$dip" in
+          */*) net="${dip%%/*}"; plen="${dip#*/}" ;;
+          *)   net="$dip"; plen=32 ;;
+        esac
+        for addr in $addrs; do
+          case "$addr" in
+            *:*) continue ;;
+          esac
+          aip="${addr%%/*}"
+          if portknock_ipv4_in_prefix "$aip" "$net" "$plen"; then
+            return 0
+          fi
+        done
+        ;;
+    esac
+  done
+
+  return 1
+}
+
+
+portknock_proto_match()
+{
+  local want="$1" list="$2" item
+  local IFS=', '
+
+  case "$list" in ""|both|all) return 0 ;; esac
+
+  for item in $list; do
+    case "$item" in
+      "$want") return 0 ;;
+      6) [ "$want" = "tcp" ] && return 0 ;;
+      17) [ "$want" = "udp" ] && return 0 ;;
+    esac
+  done
+
+  return 1
+}
+
+
+portknock_iface_in_list()
+{
+  local list="$1" kif="$2" item
+  local IFS=' '
+
+  [ -n "$list" ] || return 1
+
+  for item in $list; do
+    portknock_iface_match "$item" "$kif" && return 0
+  done
+
+  return 1
+}
+
+
+portknock_rule_family()
+{
+  local token has4=0 has6=0
+  local IFS=', '
+
+  for token in ${destips:-} ${hosts:-}; do
+    case "$token" in
+      ""|0/0|"${ANYHOST:-0/0}") continue ;;
+    esac
+
+    if command -v get_numeric_ip_version >/dev/null 2>&1; then
+      get_numeric_ip_version "$token"
+      case $? in
+        4) has4=1 ;;
+        6) has6=1 ;;
+      esac
+    else
+      case "$token" in
+        *:*) has6=1 ;;
+        *[0-9]*.*[0-9]*) has4=1 ;;
+      esac
+    fi
+  done
+
+  if [ "$has4" = "1" ] && [ "$has6" = "1" ]; then
+    printf 'both'
+  elif [ "$has6" = "1" ]; then
+    printf 'ipv6'
+  elif [ "$has4" = "1" ]; then
+    printf 'ipv4'
+  else
+    printf 'both'
+  fi
+}
+
+
+portknock_conflict_add()
+{
+  local kind="$1" family="$2" kif="$3" value
+
+  case "$family:$kind" in
+    ipv4:sequence) value="$PK_SEQ_CONFLICT_IFS_4" ;;
+    ipv6:sequence) value="$PK_SEQ_CONFLICT_IFS_6" ;;
+    both:sequence)
+      portknock_conflict_add sequence ipv4 "$kif"
+      portknock_conflict_add sequence ipv6 "$kif"
+      return 0
+      ;;
+    ipv4:target) value="$PK_TARGET_CONFLICT_IFS_4" ;;
+    ipv6:target) value="$PK_TARGET_CONFLICT_IFS_6" ;;
+    both:target)
+      portknock_conflict_add target ipv4 "$kif"
+      portknock_conflict_add target ipv6 "$kif"
+      return 0
+      ;;
+    *) return 0 ;;
+  esac
+
+  case " $value " in
+    *" $kif "*) ;;
+    *)
+      value="$value${value:+ }$kif"
+      case "$family:$kind" in
+        ipv4:sequence) PK_SEQ_CONFLICT_IFS_4="$value" ;;
+        ipv6:sequence) PK_SEQ_CONFLICT_IFS_6="$value" ;;
+        ipv4:target) PK_TARGET_CONFLICT_IFS_4="$value" ;;
+        ipv6:target) PK_TARGET_CONFLICT_IFS_6="$value" ;;
+      esac
+      ;;
+  esac
+}
+
+
+portknock_flag_port()
+{
+  local kind="$1" family="$2" proto="$3" port="$4" kif="$5" desc="$6"
+  local label action
+
+  case "$family" in
+    ipv6)
+      [ "${IPV6_SUPPORT:-0}" = "1" ] || return 0
+      label="IPv6"
+      ;;
+    both)
+      if [ "${IPV6_SUPPORT:-0}" = "1" ]; then
+        label="IPv4/IPv6"
+      else
+        family="ipv4"
+        label="IPv4"
+      fi
+      ;;
+    *)
+      label="IPv4"
+      ;;
+  esac
+
+  portknock_conflict_add "$kind" "$family" "$kif"
+
+  if [ "$PORTKNOCK_ALLOW_ALL" = "1" ]; then
+    if [ "$kind" = "target" ]; then
+      action="disabling the portknock plugin"
+    else
+      action="skipping portknock on this interface"
+    fi
+  else
+    action="disabling the $label portknock side on this interface"
+  fi
+
+  if [ "$kind" = "sequence" ]; then
+    printf '%s\n' "** WARNING: Portknock $label sequence port $proto/$port on interface \"$kif\" is already handled by $desc; $action. **" >&2
+  else
+    printf '%s\n' "** WARNING: Portknock $label target port $proto/$port on interface \"$kif\" is already handled by $desc; $action. **" >&2
+  fi
+}
+
+
+portknock_check_rule()
+{
+  local desc="$1" rule_proto="$2" all_ports="$3" rule_ports="$4"
+  local kif kind items item proto port rule_family
+
+  rule_family="$(portknock_rule_family)"
+  case "$rule_family" in
+    ipv6)
+      [ "${IPV6_SUPPORT:-0}" = "1" ] || return 0
+      ;;
+    both)
+      [ "${IPV6_SUPPORT:-0}" = "1" ] || rule_family="ipv4"
+      ;;
+  esac
+
+  for kif in $PK_IFS_LIST; do
+    portknock_iface_match "${interfaces:-}" "$kif" || continue
+    portknock_dest_match "$kif" "${destips:-}" || continue
+
+    for kind in sequence target; do
+      if [ "$kind" = "sequence" ]; then
+        items="$PK_SEQ_ITEMS"
+      else
+        items="$PK_OPEN_ITEMS"
+      fi
+
+      for item in $items; do
+        proto="${item%%/*}"
+        port="${item#*/}"
+        portknock_proto_match "$proto" "$rule_proto" || continue
+        if [ "$all_ports" = "1" ] || portknock_port_match "$port" "$rule_ports"; then
+          portknock_flag_port "$kind" "$rule_family" "$proto" "$port" "$kif" "$desc"
+        fi
+      done
+    done
+  done
+}
+
+
+portknock_check_explicit_var()
+{
+  local name="$1" rules="$2" type="$3" rule_proto="$4" all_ports="$5"
+  local rule IFS
+
+  IFS=' '
+  for rule in $rules; do
+    [ -n "$rule" ] || continue
+    destips=""
+    hosts=""
+    interfaces=""
+    ports=""
+    protos=""
+    if parse_rule "$rule" "$name" "$type"; then
+      portknock_check_rule "$name" "$rule_proto" "$all_ports" "${ports:-}"
+    fi
+  done
+}
+
+
+portknock_check_explicit_proto_var()
+{
+  local name="$1" rules="$2" type="$3"
+  local rule IFS
+
+  IFS=' '
+  for rule in $rules; do
+    [ -n "$rule" ] || continue
+    destips=""
+    hosts=""
+    interfaces=""
+    ports=""
+    protos=""
+    if parse_rule "$rule" "$name" "$type"; then
+      portknock_check_rule "$name" "${protos:-}" 1 ""
+    fi
+  done
+}
+
+
+portknock_flag_global_ports()
+{
+  local family="$1" proto="$2" spec="$3" desc="$4"
+  local kif kind items item iproto iport
+
+  [ "$family" = "ipv6" ] && [ "${IPV6_SUPPORT:-0}" != "1" ] && return 0
+
+  for kif in $PK_IFS_LIST; do
+    for kind in sequence target; do
+      if [ "$kind" = "sequence" ]; then
+        items="$PK_SEQ_ITEMS"
+      else
+        items="$PK_OPEN_ITEMS"
+      fi
+
+      for item in $items; do
+        iproto="${item%%/*}"
+        iport="${item#*/}"
+        [ "$iproto" = "$proto" ] || continue
+        portknock_port_match "$iport" "$spec" || continue
+        portknock_flag_port "$kind" "$family" "$iproto" "$iport" "$kif" "$desc"
+      done
+    done
+  done
+}
+
+
+portknock_check_hardcoded()
+{
+  if [ "${EXT_IF_DHCP_IP:-0}" = "1" ]; then
+    portknock_flag_global_ports ipv4 udp 68 "hardcoded DHCP client rule (EXT_IF_DHCP_IP)"
+  fi
+
+  if { [ "${EXT_IF_DHCP_IP:-0}" = "1" ] || [ "${EXT_IF_DHCPV6_IPV6:-0}" = "1" ]; } &&
+     [ "${IPV6_SUPPORT:-0}" = "1" ]; then
+    portknock_flag_global_ports ipv6 udp 546 "hardcoded DHCPv6 client rule"
+  fi
+
+  if [ "${EXTERNAL_DHCP_SERVER:-0}" = "1" ]; then
+    portknock_flag_global_ports ipv4 udp 67 "hardcoded DHCP server rule (EXTERNAL_DHCP_SERVER)"
+    portknock_flag_global_ports ipv4 udp 68 "hardcoded DHCP server reply rule"
+  fi
+
+  if [ "${EXTERNAL_DHCPV6_SERVER:-0}" = "1" ] && [ "${IPV6_SUPPORT:-0}" = "1" ]; then
+    portknock_flag_global_ports ipv6 udp 547 "hardcoded DHCPv6 server rule (EXTERNAL_DHCPV6_SERVER)"
+  fi
+
+  if [ "${NMB_BROADCAST_FIX:-0}" = "1" ] && [ -n "${LOCAL_PORT_RANGE:-}" ]; then
+    portknock_flag_global_ports ipv4 udp "${LOCAL_PORT_RANGE:-}" "hardcoded NMB broadcast rule (NMB_BROADCAST_FIX)"
+  fi
+}
+
+
+portknock_warn_blocklists()
+{
+  local file base line found_block=0 found_netset=0
+
+  case " ${BLOCK_HOSTS:-} " in
+    *" 0/0 "*|*" 0.0.0.0/0 "*) found_block=1 ;;
+  esac
+  if [ "${IPV6_SUPPORT:-0}" = "1" ]; then
+    case " ${BLOCK_HOSTS:-} " in
+      *" ::/0 "*) found_block=1 ;;
+    esac
+  fi
+
+  if [ -n "${BLOCK_HOSTS_FILE:-}" ] && [ -f "$BLOCK_HOSTS_FILE" ]; then
+    while IFS= read -r line; do
+      line="${line%%[#;]*}"
+      case " $line " in
+        *" 0/0 "*|*" 0.0.0.0/0 "*) found_block=1 ;;
+      esac
+      if [ "${IPV6_SUPPORT:-0}" = "1" ]; then
+        case " $line " in
+          *" ::/0 "*) found_block=1 ;;
+        esac
+      fi
+    done < "$BLOCK_HOSTS_FILE"
+  fi
+
+  if [ -n "${BLOCK_NETSET_DIR:-}" ] && [ -d "$BLOCK_NETSET_DIR" ]; then
+    for file in "$BLOCK_NETSET_DIR"/*.netset; do
+      [ -f "$file" ] || continue
+      base="${file##*/}"
+
+      case "$base" in
+        whitelist.netset|whitelistv6.netset) continue ;;
+      esac
+
+      case "$base" in
+        *[vV]6.netset)
+          [ "${IPV6_SUPPORT:-0}" = "1" ] || continue
+          if grep -Eq '^[[:space:]]*::/0([[:space:]]|$)' "$file" 2>/dev/null; then
+            found_netset=1
+            break
+          fi
+          ;;
+        *)
+          if grep -Eq '^[[:space:]]*(0/0|0\.0\.0\.0/0)([[:space:]]|$)' "$file" 2>/dev/null; then
+            found_netset=1
+            break
+          fi
+          ;;
+      esac
+    done
+  fi
+
+  if [ "$found_block" = "1" ]; then
+    printf '%s\n' "** WARNING: BLOCK_HOSTS/BLOCK_HOSTS_FILE contains all sources; HOST_BLOCK_SRC will drop all knocks before portknock. **" >&2
+  fi
+  if [ "$found_netset" = "1" ]; then
+    printf '%s\n' "** WARNING: A .netset blocklist contains all sources; HOST_BLOCK_SRC will drop all knocks before portknock unless the source is in the netset whitelist. **" >&2
+  fi
+
+  return 0
+}
+
+
+portknock_build_lists()
+{
+  local iface item IFS
+
+  PK_IFS_LIST=""
+  IFS=' ,'
+  for iface in ${PORTKNOCK_INTERFACE:-${EXT_IF:-}}; do
+    [ -n "$iface" ] || continue
+    case " $PK_IFS_LIST " in
+      *" $iface "*) ;;
+      *) PK_IFS_LIST="$PK_IFS_LIST${PK_IFS_LIST:+ }$iface" ;;
+    esac
+  done
+
+  PK_SEQ_ITEMS=""
+  PK_OPEN_ITEMS=""
+
+  for item in ${PORTKNOCK_SEQUENCE:-}; do
+    portknock_parse_item "$item" || continue
+    case " $PK_SEQ_ITEMS " in
+      *" $PK_PROTO/$PK_PORT "*) ;;
+      *) PK_SEQ_ITEMS="$PK_SEQ_ITEMS${PK_SEQ_ITEMS:+ }$PK_PROTO/$PK_PORT" ;;
+    esac
+  done
+
+  for item in ${PORTKNOCK_OPEN:-}; do
+    portknock_parse_item "$item" || continue
+    case " $PK_OPEN_ITEMS " in
+      *" $PK_PROTO/$PK_PORT "*) ;;
+      *) PK_OPEN_ITEMS="$PK_OPEN_ITEMS${PK_OPEN_ITEMS:+ }$PK_PROTO/$PK_PORT" ;;
+    esac
+  done
+}
+
+
+portknock_line_iface_match()
+{
+  local line="$1" kif="$2" spec val kprefix vp name prefix set rc
+  local IFS=', '
+
+  case "$line" in
+    *iifname*) ;;
+    *)
+      case "$line" in
+        *"iif "*)
+          spec="${line#*iif }"
+          spec="${spec#"${spec%%[![:space:]]*}"}"
+          spec="${spec%% *}"
+          spec="${spec#\"}"; spec="${spec%\"}"
+          if ! name="$(portknock_resolve_iif "$spec" 2>/dev/null)" || [ -z "$name" ]; then
+            printf '%s\n' "** WARNING: Cannot verify iif \"$spec\" rule; please check manually. **" >&2
+            return 0
+          fi
+          case "$kif" in
+            *+) prefix="${kif%+}"
+                case "$name" in "$prefix"*) return 0 ;; esac
+                return 1
+                ;;
+             *) [ "$name" = "$kif" ] && return 0
+                return 1
+                ;;
+          esac
+          ;;
+        *) return 0 ;;
+      esac
+      ;;
+  esac
+
+  case "$kif" in
+    *+) kprefix="${kif%+}" ;;
+     *) kprefix="" ;;
+  esac
+
+  # Negated interface match
+  case "$line" in
+    *"iifname !="*)
+      spec="${line#*iifname !=}"
+      spec="${spec#"${spec%%[![:space:]]*}"}"
+      case "$spec" in
+        \{*) spec="${spec#\{}"; spec="${spec%%\}*}" ;;
+         *) spec="${spec%% *}" ;;
+      esac
+      case "$spec" in
+        @*)
+          set="${spec%% *}"
+          portknock_resolve_iface_set "$set" "$kif"; rc=$?
+          if [ "$rc" -eq 2 ]; then
+            printf '%s\n' "** WARNING: Cannot verify iifname set \"$set\"; please check manually. **" >&2
+            return 0
+          fi
+          [ "$rc" -eq 0 ] && return 1
+          return 0
+          ;;
+      esac
+      for val in $spec; do
+        val="${val#\"}"; val="${val%\"}"
+        [ -n "$val" ] || continue
+        case "$val" in
+          *\*)
+            vp="${val%\*}"
+            if [ -n "$kprefix" ]; then
+              case "$vp" in "$kprefix"*) return 1 ;; esac
+              case "$kprefix" in "$vp"*) return 1 ;; esac
+            else
+              case "$kif" in "$vp"*) return 1 ;; esac
+            fi
+            ;;
+          *)
+            if [ -n "$kprefix" ]; then
+              case "$val" in "$kprefix"*) return 1 ;; esac
+            else
+              [ "$val" = "$kif" ] && return 1
+            fi
+            ;;
+        esac
+      done
+      return 0
+      ;;
+  esac
+
+  spec="${line#*iifname }"
+  spec="${spec#"${spec%%[![:space:]]*}"}"
+  case "$spec" in
+    @*)
+      set="${spec%% *}"
+      portknock_resolve_iface_set "$set" "$kif"; rc=$?
+      if [ "$rc" -eq 2 ]; then
+        printf '%s\n' "** WARNING: Cannot verify iifname set \"$set\"; please check manually. **" >&2
+        return 0
+      fi
+      return "$rc"
+      ;;
+    \{*) spec="${spec#\{}"; spec="${spec%%\}*}" ;;
+     *) spec="${spec%% *}" ;;
+  esac
+
+  for val in $spec; do
+    val="${val#\"}"; val="${val%\"}"
+    [ -n "$val" ] || continue
+    case "$val" in
+      *\*)
+        vp="${val%\*}"
+        if [ -n "$kprefix" ]; then
+          case "$vp" in "$kprefix"*) return 0 ;; esac
+          case "$kprefix" in "$vp"*) return 0 ;; esac
+        else
+          case "$kif" in "$vp"*) return 0 ;; esac
+        fi
+        ;;
+      *)
+        if [ -n "$kprefix" ]; then
+          case "$val" in "$kprefix"*) return 0 ;; esac
+        else
+          [ "$val" = "$kif" ] && return 0
+        fi
+        ;;
+    esac
+  done
+
+  return 1
+}
+
+
+portknock_line_proto_match()
+{
+  local line="$1" proto="$2"
+
+  case "$line" in
+    *"tcp dport"*|*"tcp sport"*) [ "$proto" = "tcp" ] && return 0 || return 1 ;;
+    *"udp dport"*|*"udp sport"*) [ "$proto" = "udp" ] && return 0 || return 1 ;;
+  esac
+
+  case "$line" in
+    *"th dport"*)
+      case "$line" in
+        *"meta l4proto tcp"*|*"ip protocol tcp"*) [ "$proto" = "tcp" ] && return 0 || return 1 ;;
+        *"meta l4proto udp"*|*"ip protocol udp"*) [ "$proto" = "udp" ] && return 0 || return 1 ;;
+        *) return 0 ;;
+      esac
+      ;;
+  esac
+
+  case "$line" in
+    *"meta l4proto tcp"*|*"ip protocol tcp"*) [ "$proto" = "tcp" ] && return 0 || return 1 ;;
+    *"meta l4proto udp"*|*"ip protocol udp"*) [ "$proto" = "udp" ] && return 0 || return 1 ;;
+  esac
+
+  return 0
+}
+
+
+portknock_resolve_port_set()
+{
+  local set="$1" port="$2" type elements
+  local IFS=', '
+
+  case "$set" in @*) set="${set#@}" ;; esac
+  [ -n "$set" ] || return 2
+  [ -n "${NFT:-}" ] || return 2
+
+  type="$("$NFT" list set inet "$NFT_TABLE" "$set" 2>/dev/null | awk '/^[[:space:]]*type / { print $2; exit }')"
+  [ "$type" = "inet_service" ] || return 2
+
+  elements="$("$NFT" list set inet "$NFT_TABLE" "$set" 2>/dev/null | tr -d '\n' | sed -n -e 's/^.*elements = { *\([^}]*\)}.*$/\1/p')"
+  [ -n "$elements" ] || return 1
+
+  portknock_port_match "$port" "$elements"
+}
+
+
+portknock_resolve_iface_set()
+{
+  local set="$1" kif="$2" type elements val vp prefix
+  local IFS=', '
+
+  case "$set" in @*) set="${set#@}" ;; esac
+  [ -n "$set" ] || return 2
+  [ -n "${NFT:-}" ] || return 2
+
+  type="$("$NFT" list set inet "$NFT_TABLE" "$set" 2>/dev/null | awk '/^[[:space:]]*type / { print $2; exit }')"
+  [ "$type" = "ifname" ] || return 2
+
+  elements="$("$NFT" list set inet "$NFT_TABLE" "$set" 2>/dev/null | tr -d '\n' | sed -n -e 's/^.*elements = { *\([^}]*\)}.*$/\1/p')"
+  [ -n "$elements" ] || return 1
+
+  case "$kif" in *+) prefix="${kif%+}" ;; *) prefix="" ;; esac
+
+  for val in $elements; do
+    val="${val#\"}"; val="${val%\"}"
+    [ -n "$val" ] || continue
+    case "$val" in
+      *\*)
+        vp="${val%\*}"
+        if [ -n "$prefix" ]; then
+          case "$vp" in "$prefix"*) return 0 ;; esac
+          case "$prefix" in "$vp"*) return 0 ;; esac
+        else
+          case "$kif" in "$vp"*) return 0 ;; esac
+        fi
+        ;;
+      *)
+        if [ -n "$prefix" ]; then
+          case "$val" in "$prefix"*) return 0 ;; esac
+        else
+          [ "$val" = "$kif" ] && return 0
+        fi
+        ;;
+    esac
+  done
+
+  return 1
+}
+
+
+portknock_resolve_iif()
+{
+  local idx="$1" name
+
+  case "$idx" in
+    ""|*[!0-9]*) printf '%s' "$idx"; return 0 ;;
+  esac
+
+  name="$(ip -o link show 2>/dev/null | awk -v i="$idx" '$1 == i":" { n=$2; sub(/:$/, "", n); print n; exit }')"
+  [ -n "$name" ] || return 1
+  printf '%s' "$name"
+}
+
+
+portknock_line_ports_match()
+{
+  local line="$1" port="$2" spec
+
+  case "$line" in
+    *" dport "*) spec="${line#* dport }" ;;
+    *" dport"*) spec="${line#* dport}" ;;
+    *) return 1 ;;
+  esac
+
+  case "$spec" in
+    \{*) spec="${spec#\{}"; spec="${spec%%\}*}" ;;
+     *) spec="${spec%% *}" ;;
+  esac
+
+  case "$spec" in
+    !=*|*vmap*|*map*) return 2 ;;
+    @*) portknock_resolve_port_set "$spec" "$port"; return $? ;;
+  esac
+
+  portknock_port_match "$port" "$spec"
+}
+
+
+portknock_line_verdict()
+{
+  local line="$1"
+
+  case " $line " in
+    *" accept "*) printf 'accept' ;;
+    *" drop "*) printf 'drop' ;;
+    *" reject "*) printf 'reject' ;;
+    *" jump "*) printf 'jump' ;;
+    *) return 1 ;;
+  esac
+}
+
+
+portknock_warn_line()
+{
+  local chain="$1" line="$2" clean verdict kif kind items item proto port ps msg has_dport
+
+  case "$line" in
+    *'comment "OPEN_TCP"'*|*'comment "OPEN_UDP"'*|*'comment "HOST_OPEN_TCP"'*|*'comment "HOST_OPEN_UDP"'*|*'comment "FULL_ACCESS_HOSTS"'*|*'comment "OPEN_IP"'*|*'comment "HOST_OPEN_IP"'*|*'comment "portknock"'*) return 0 ;;
+  esac
+
+  clean="$(printf '%s' "$line" | sed 's/"[^"]*"//g')"
+  verdict="$(portknock_line_verdict "$clean")" || return 0
+
+  if [ "${IPV6_SUPPORT:-0}" != "1" ]; then
+    case "$clean" in
+      *"ip6 "*|*"ipv6"*) return 0 ;;
+    esac
+  fi
+
+  case "$clean" in
+    *" dport "*) has_dport=1 ;;
+    *) has_dport=0 ;;
+  esac
+
+  if [ "$has_dport" = "0" ]; then
+    case "$verdict" in
+      accept) ;;
+      *) return 0 ;;
+    esac
+    case "$clean" in
+      *"ct state established"*|*"ct state related"*|*"ct state invalid"*|*icmp*) return 0 ;;
+    esac
+    for kif in $PK_IFS_LIST; do
+      portknock_line_iface_match "$line" "$kif" || continue
+      printf '%s\n' "** WARNING: Existing rule in $chain may affect all ports (no dport) on \"$kif\"; please verify: $line **" >&2
+    done
+    return 0
+  fi
+
+  for kif in $PK_IFS_LIST; do
+    portknock_line_iface_match "$line" "$kif" || continue
+
+    for kind in sequence target; do
+      if [ "$kind" = "sequence" ]; then
+        items="$PK_SEQ_ITEMS"
+      else
+        items="$PK_OPEN_ITEMS"
+      fi
+
+      for item in $items; do
+        proto="${item%%/*}"
+        port="${item#*/}"
+        portknock_line_proto_match "$clean" "$proto" || continue
+        portknock_line_ports_match "$clean" "$port"
+        ps=$?
+        if [ "$ps" -eq 2 ]; then
+          printf '%s\n' "** WARNING: Cannot verify existing rule in $chain for $proto/$port on \"$kif\"; please check: $line **" >&2
+          continue
+        fi
+        [ "$ps" -eq 0 ] || continue
+
+        case "$verdict:$kind" in
+          accept:sequence) msg="accepts knock-sequence port" ;;
+          accept:target) msg="accepts target port" ;;
+          drop:sequence|reject:sequence) msg="blocks knock-sequence port" ;;
+          drop:target|reject:target) msg="blocks target port" ;;
+          jump:sequence|jump:target) msg="jumps on" ;;
+          *) continue ;;
+        esac
+
+        printf '%s\n' "** WARNING: Existing rule in $chain $msg $proto/$port on \"$kif\"; please verify: $line **" >&2
+      done
+    done
+  done
+}
+
+
+portknock_warn_other_rules()
+{
+  local src chain line rest table rule
+
+  [ -n "${NFT:-}" ] || return 0
+  [ -n "$PK_IFS_LIST" ] || return 0
+
+  src="${PK_WARN_SOURCE:-batch}"
+
+  if [ "$src" = "live" ]; then
+    for chain in $PK_INPUT_CHAINS; do
+      "$NFT" list chain inet "$NFT_TABLE" "$chain" 2>/dev/null | \
+        while IFS= read -r line; do
+          rule="${line#"${line%%[![:space:]]*}"}"
+          case "$rule" in
+            ""|table\ *|chain\ *|\}|*"type filter hook "*) continue ;;
+          esac
+          portknock_warn_line "$chain" "$rule"
+        done
+    done
+    return 0
+  fi
+
+  if [ "${NFT_BATCH:-1}" = "0" ] || [ ! -f "${NFT_BATCH_FILE:-}" ]; then
+    PK_WARN_SOURCE="live"
+    portknock_warn_other_rules
+    return 0
+  fi
+
+  while IFS= read -r line; do
+    case "$line" in
+      *" rule inet "*) ;;
+      *) continue ;;
+    esac
+    rest="${line#* rule inet }"
+    table="${rest%% *}"
+    rest="${rest#* }"
+    [ "$table" = "$NFT_TABLE" ] || continue
+    chain="${rest%% *}"
+    rule="${rest#* }"
+    case " $PK_INPUT_CHAINS " in
+      *" $chain "*) ;;
+      *) continue ;;
+    esac
+    portknock_warn_line "$chain" "$rule"
+  done < "$NFT_BATCH_FILE"
+}
+
+
+portknock_check_conflicts()
+{
+  local mode="${1:-batch}"
+
+  PK_SEQ_CONFLICT_IFS_4=""
+  PK_SEQ_CONFLICT_IFS_6=""
+  PK_TARGET_CONFLICT_IFS_4=""
+  PK_TARGET_CONFLICT_IFS_6=""
+  PK_WARN_SOURCE="$mode"
+  PK_INPUT_CHAINS="INPUT INPUT_CHAIN EXT_INPUT_CHAIN INT_INPUT_CHAIN DMZ_INPUT_CHAIN POST_INPUT_CHAIN"
+
+  portknock_build_lists
+  [ -n "$PK_IFS_LIST" ] || return 0
+
+  portknock_check_explicit_var OPEN_TCP "${OPEN_TCP:-}" "interfaces-destips-ports" tcp 0
+  portknock_check_explicit_var OPEN_UDP "${OPEN_UDP:-}" "interfaces-destips-ports" udp 0
+  portknock_check_explicit_var HOST_OPEN_TCP "${HOST_OPEN_TCP:-}" "interfaces-destips-hosts-ports" tcp 0
+  portknock_check_explicit_var HOST_OPEN_UDP "${HOST_OPEN_UDP:-}" "interfaces-destips-hosts-ports" udp 0
+  portknock_check_explicit_var FULL_ACCESS_HOSTS "${FULL_ACCESS_HOSTS:-}" "interfaces-destips-hosts" both 1
+  portknock_check_explicit_proto_var OPEN_IP "${OPEN_IP:-}" "interfaces-destips-protos"
+  portknock_check_explicit_proto_var HOST_OPEN_IP "${HOST_OPEN_IP:-}" "interfaces-destips-hosts-protos"
+
+  portknock_check_hardcoded
+  portknock_warn_other_rules
+
+  if [ "$PORTKNOCK_ALLOW_ALL" = "1" ]; then
+    [ -n "$PK_TARGET_CONFLICT_IFS_4$PK_TARGET_CONFLICT_IFS_6" ] && return 1
+  fi
+
+  return 0
+}
+
+
+portknock_check_config_perms()
+{
+  # The sequence is a shared secret, so the config should be root-only.
+  if [ -n "$(find "$CONF_FILE" -perm /077 2>/dev/null)" ]; then
+    printf '%s\n' "** WARNING: $CONF_FILE is group/other readable; the knock sequence should be kept root-only (0600). **" >&2
+  fi
+
+  return 0
+}
+
+
+portknock_validate_config()
+{
+  local item seq_count=0 open_count=0 seq_list=" " open_list=" " IFS
+
+  if [ -z "$PORTKNOCK_SEQUENCE" ]; then
+    printf '%s\n' "** ERROR: PORTKNOCK_SEQUENCE is empty. **" >&2
+    return 1
+  fi
+
+  if [ -z "$PORTKNOCK_OPEN" ]; then
+    printf '%s\n' "** ERROR: PORTKNOCK_OPEN is empty. **" >&2
+    return 1
+  fi
+
+  IFS=' ,'
+  for item in ${PORTKNOCK_SEQUENCE:-}; do
+    if ! portknock_parse_item "$item"; then
+      printf '%s\n' "** ERROR: Invalid PORTKNOCK_SEQUENCE item \"$item\". **" >&2
+      return 1
+    fi
+    seq_count=$((seq_count + 1))
+    seq_list="$seq_list$PK_PROTO/$PK_PORT "
+  done
+
+  for item in ${PORTKNOCK_OPEN:-}; do
+    if ! portknock_parse_item "$item"; then
+      printf '%s\n' "** ERROR: Invalid PORTKNOCK_OPEN item \"$item\". **" >&2
+      return 1
+    fi
+    open_count=$((open_count + 1))
+    open_list="$open_list$PK_PROTO/$PK_PORT "
+  done
+
+  if [ "$seq_count" -eq 0 ] || [ "$open_count" -eq 0 ]; then
+    printf '%s\n' "** ERROR: PORTKNOCK_SEQUENCE and PORTKNOCK_OPEN must not be empty. **" >&2
+    return 1
+  fi
+
+  if [ "$seq_count" -lt 3 ]; then
+    printf '%s\n' "** WARNING: A portknock sequence with fewer than 3 steps is weak. **" >&2
+  fi
+
+  # A target port that is also a knock port would make the knock port reachable
+  IFS=' '
+  for item in $open_list; do
+    case " $seq_list " in
+      *" $item "*)
+        printf '%s\n' "** ERROR: Target \"$item\" is also part of the knock sequence. **" >&2
+        return 1
+        ;;
+    esac
+  done
+
+  case "$PORTKNOCK_ALLOW_ALL" in
+    0|1) ;;
+    *) printf '%s\n' "** ERROR: PORTKNOCK_ALLOW_ALL must be 0 or 1. **" >&2
+       return 1 ;;
+  esac
+
+  case "$PORTKNOCK_LOG" in
+    0|1) ;;
+    *) printf '%s\n' "** ERROR: PORTKNOCK_LOG must be 0 or 1. **" >&2
+       return 1 ;;
+  esac
+
+  case "${PORTKNOCK_CHECK_CONFLICTS:-1}" in
+    0|1) ;;
+    *) printf '%s\n' "** ERROR: PORTKNOCK_CHECK_CONFLICTS must be 0 or 1. **" >&2
+       return 1 ;;
+  esac
+
+  portknock_require_uint PORTKNOCK_OPEN_TIME "$PORTKNOCK_OPEN_TIME" || return 1
+  portknock_require_uint PORTKNOCK_SEQ_TIMEOUT "$PORTKNOCK_SEQ_TIMEOUT" || return 1
+  portknock_require_uint PORTKNOCK_MAX_CLIENTS "$PORTKNOCK_MAX_CLIENTS" || return 1
+  portknock_require_uint PORTKNOCK_STAGE_SIZE "$PORTKNOCK_STAGE_SIZE" || return 1
+
+  if [ "$PORTKNOCK_ALLOW_ALL" = "1" ] && [ "$PORTKNOCK_OPEN_TIME" -gt 300 ] 2>/dev/null; then
+    printf '%s\n' "** WARNING: PORTKNOCK_ALLOW_ALL=1 with an open time above 300s is risky. **" >&2
+  fi
+
+  return 0
+}
+
+
+# Plugin start function
+plugin_start()
+{
+  local item iface proto port seq_count stage last tcp_ports udp_ports
+  local set4 set6 prev4 prev6 match target_stmt rule jump_ifaces
+  local use_v4 use_v6 v4_off v6_off
+  local IFS
+
+  # Check for ports already handled by firewall.conf / hardcoded ANF rules
+  if [ "${PORTKNOCK_CHECK_CONFLICTS:-1}" = "1" ]; then
+    if ! portknock_check_conflicts; then
+      printf '%s\n' "** ERROR: Portknock is disabled because one or more target ports are already handled by firewall.conf. **" >&2
+      ENABLED=0
+      return 1
+    fi
+  else
+    PK_SEQ_CONFLICT_IFS_4=""
+    PK_SEQ_CONFLICT_IFS_6=""
+    PK_TARGET_CONFLICT_IFS_4=""
+    PK_TARGET_CONFLICT_IFS_6=""
+    portknock_build_lists
+  fi
+
+  portknock_warn_blocklists
+
+  # Target port lists
+  tcp_ports=""
+  udp_ports=""
+  IFS=' ,'
+  for item in ${PORTKNOCK_OPEN:-}; do
+    portknock_parse_item "$item" || continue
+    case "$PK_PROTO" in
+      tcp) case " $tcp_ports " in
+             *" $PK_PORT "*) ;;
+             *) tcp_ports="$tcp_ports${tcp_ports:+, }$PK_PORT" ;;
+           esac ;;
+      udp) case " $udp_ports " in
+             *" $PK_PORT "*) ;;
+             *) udp_ports="$udp_ports${udp_ports:+, }$PK_PORT" ;;
+           esac ;;
+    esac
+  done
+
+  # Count the sequence steps
+  seq_count=0
+  for item in ${PORTKNOCK_SEQUENCE:-}; do
+    seq_count=$((seq_count + 1))
+  done
+
+  # Determine which families and interfaces remain usable
+  jump_ifaces=""
+  use_v4=0
+  use_v6=0
+
+  if [ "$PORTKNOCK_ALLOW_ALL" = "1" ]; then
+    for iface in $PK_IFS_LIST; do
+      if portknock_iface_in_list "$PK_SEQ_CONFLICT_IFS_4" "$iface" ||
+         portknock_iface_in_list "$PK_SEQ_CONFLICT_IFS_6" "$iface"; then
+        continue
+      fi
+      jump_ifaces="$jump_ifaces${jump_ifaces:+ }$iface"
+    done
+    use_v4=1
+    [ "${IPV6_SUPPORT:-0}" = "1" ] && use_v6=1
+  else
+    for iface in $PK_IFS_LIST; do
+      v4_off=0
+      v6_off=0
+
+      if portknock_iface_in_list "$PK_TARGET_CONFLICT_IFS_4" "$iface" ||
+         portknock_iface_in_list "$PK_SEQ_CONFLICT_IFS_4" "$iface"; then
+        v4_off=1
+      fi
+
+      if [ "${IPV6_SUPPORT:-0}" != "1" ]; then
+        v6_off=1
+      elif portknock_iface_in_list "$PK_TARGET_CONFLICT_IFS_6" "$iface" ||
+           portknock_iface_in_list "$PK_SEQ_CONFLICT_IFS_6" "$iface"; then
+        v6_off=1
+      fi
+
+      [ "$v4_off" = "0" ] && use_v4=1
+      [ "$v6_off" = "0" ] && use_v6=1
+
+      if [ "$v4_off" = "0" ] || [ "$v6_off" = "0" ]; then
+        jump_ifaces="$jump_ifaces${jump_ifaces:+ }$iface"
+      fi
+    done
+  fi
+
+  if [ -z "$jump_ifaces" ] || { [ "$use_v4" = "0" ] && [ "$use_v6" = "0" ]; }; then
+    printf '%s\n' "** WARNING: Portknock is disabled because no configured interface/family remains available. **" >&2
+    ENABLED=0
+    return 0
+  fi
+
+  # Sets holding the opened state
+  if [ "$PORTKNOCK_ALLOW_ALL" = "1" ]; then
+    printf '%s\n' "** WARNING: Portknock will allow ALL remote IPs to the target ports for ${PORTKNOCK_OPEN_TIME}s. **" >&2
+    nft_cmd "add set inet $NFT_TABLE anf_pk_open_ifs { type ifname; flags dynamic,timeout; timeout ${PORTKNOCK_OPEN_TIME}s; size 64; }"
+  else
+    if [ "$use_v4" = "1" ]; then
+      nft_cmd "add set inet $NFT_TABLE anf_pk_allowed_4 { type ipv4_addr; flags dynamic,timeout; timeout ${PORTKNOCK_OPEN_TIME}s; size ${PORTKNOCK_MAX_CLIENTS}; }"
+    fi
+    if [ "$use_v6" = "1" ]; then
+      nft_cmd "add set inet $NFT_TABLE anf_pk_allowed_6 { type ipv6_addr; flags dynamic,timeout; timeout ${PORTKNOCK_OPEN_TIME}s; size ${PORTKNOCK_MAX_CLIENTS}; }"
+    fi
+  fi
+
+  nft_chain PORTKNOCK_CHAIN
+
+  # Source mode: gate disabled family sides before any portknock checks
+  if [ "$PORTKNOCK_ALLOW_ALL" != "1" ]; then
+    if [ "$use_v4" = "0" ]; then
+      nft_rule PORTKNOCK_CHAIN "meta nfproto ipv4 return"
+    fi
+    if [ "$use_v6" = "0" ]; then
+      nft_rule PORTKNOCK_CHAIN "meta nfproto ipv6 return"
+    fi
+
+    for iface in $PK_IFS_LIST; do
+      v4_off=0
+      v6_off=0
+
+      if portknock_iface_in_list "$PK_TARGET_CONFLICT_IFS_4" "$iface" ||
+         portknock_iface_in_list "$PK_SEQ_CONFLICT_IFS_4" "$iface"; then
+        v4_off=1
+      fi
+
+      if [ "${IPV6_SUPPORT:-0}" != "1" ]; then
+        v6_off=1
+      elif portknock_iface_in_list "$PK_TARGET_CONFLICT_IFS_6" "$iface" ||
+           portknock_iface_in_list "$PK_SEQ_CONFLICT_IFS_6" "$iface"; then
+        v6_off=1
+      fi
+
+      if [ "$use_v4" = "1" ] && [ "$v4_off" = "1" ]; then
+        nft_rule PORTKNOCK_CHAIN "$(nft_if iifname "$iface") meta nfproto ipv4 return"
+      fi
+      if [ "$use_v6" = "1" ] && [ "$v6_off" = "1" ]; then
+        nft_rule PORTKNOCK_CHAIN "$(nft_if iifname "$iface") meta nfproto ipv6 return"
+      fi
+    done
+  fi
+
+  # Preserve ANF's reserved-address checks for active families
+  nft_rule PORTKNOCK_CHAIN "jump RESERVED_NET_CHK"
+
+  # Target accepts
+  if [ "$PORTKNOCK_ALLOW_ALL" = "1" ]; then
+    [ -n "$tcp_ports" ] && nft_rule PORTKNOCK_CHAIN "meta nfproto ipv4 iifname @anf_pk_open_ifs tcp dport { $tcp_ports } accept"
+    [ -n "$udp_ports" ] && nft_rule PORTKNOCK_CHAIN "meta nfproto ipv4 iifname @anf_pk_open_ifs udp dport { $udp_ports } accept"
+    if [ "$use_v6" = "1" ]; then
+      [ -n "$tcp_ports" ] && nft_rule PORTKNOCK_CHAIN "meta nfproto ipv6 iifname @anf_pk_open_ifs tcp dport { $tcp_ports } accept"
+      [ -n "$udp_ports" ] && nft_rule PORTKNOCK_CHAIN "meta nfproto ipv6 iifname @anf_pk_open_ifs udp dport { $udp_ports } accept"
+    fi
+  else
+    if [ "$use_v4" = "1" ]; then
+      [ -n "$tcp_ports" ] && nft_rule PORTKNOCK_CHAIN "ip saddr @anf_pk_allowed_4 tcp dport { $tcp_ports } accept"
+      [ -n "$udp_ports" ] && nft_rule PORTKNOCK_CHAIN "ip saddr @anf_pk_allowed_4 udp dport { $udp_ports } accept"
+    fi
+    if [ "$use_v6" = "1" ]; then
+      [ -n "$tcp_ports" ] && nft_rule PORTKNOCK_CHAIN "ip6 saddr @anf_pk_allowed_6 tcp dport { $tcp_ports } accept"
+      [ -n "$udp_ports" ] && nft_rule PORTKNOCK_CHAIN "ip6 saddr @anf_pk_allowed_6 udp dport { $udp_ports } accept"
+    fi
+  fi
+
+  # Sequence state machine
+  stage=0
+  prev4=""
+  prev6=""
+  for item in ${PORTKNOCK_SEQUENCE:-}; do
+    portknock_parse_item "$item" || continue
+    proto="$PK_PROTO"
+    port="$PK_PORT"
+    stage=$((stage + 1))
+    last=0
+    [ "$stage" -eq "$seq_count" ] && last=1
+
+    set4=""
+    set6=""
+
+    if [ "$last" -eq 0 ]; then
+      if [ "$use_v4" = "1" ]; then
+        set4="anf_pk_stage${stage}_4"
+        nft_cmd "add set inet $NFT_TABLE $set4 { type ipv4_addr; flags dynamic,timeout; timeout ${PORTKNOCK_SEQ_TIMEOUT}s; size ${PORTKNOCK_STAGE_SIZE}; }"
+      fi
+      if [ "$use_v6" = "1" ]; then
+        set6="anf_pk_stage${stage}_6"
+        nft_cmd "add set inet $NFT_TABLE $set6 { type ipv6_addr; flags dynamic,timeout; timeout ${PORTKNOCK_SEQ_TIMEOUT}s; size ${PORTKNOCK_STAGE_SIZE}; }"
+      fi
+    fi
+
+    case "$proto" in
+      tcp) match="tcp flags & (syn|ack) == syn tcp dport $port ct state new" ;;
+      udp) match="udp dport $port ct state new" ;;
+    esac
+
+    # IPv4 rule
+    if [ "$use_v4" = "1" ]; then
+      if [ "$last" -eq 1 ]; then
+        if [ "$PORTKNOCK_ALLOW_ALL" = "1" ]; then
+          target_stmt="update @anf_pk_open_ifs { iifname timeout ${PORTKNOCK_OPEN_TIME}s }"
+        else
+          target_stmt="update @anf_pk_allowed_4 { ip saddr timeout ${PORTKNOCK_OPEN_TIME}s }"
+        fi
+        if [ -n "$prev4" ]; then
+          rule="meta nfproto ipv4 $match ip saddr @$prev4 $target_stmt delete @$prev4 { ip saddr }"
+        else
+          rule="meta nfproto ipv4 $match $target_stmt"
+        fi
+        if [ "$PORTKNOCK_LOG" = "1" ]; then
+          rule="$rule limit rate 1/second burst 5 packets log prefix \"ANF:Portknock opened: \" level $LOGLEVEL"
+        fi
+        nft_rule PORTKNOCK_CHAIN "$rule drop"
+      else
+        if [ -n "$prev4" ]; then
+          nft_rule PORTKNOCK_CHAIN "meta nfproto ipv4 $match ip saddr @$prev4 update @$set4 { ip saddr timeout ${PORTKNOCK_SEQ_TIMEOUT}s } delete @$prev4 { ip saddr } drop"
+        else
+          nft_rule PORTKNOCK_CHAIN "meta nfproto ipv4 $match update @$set4 { ip saddr timeout ${PORTKNOCK_SEQ_TIMEOUT}s } drop"
+        fi
+      fi
+    fi
+
+    # IPv6 rule
+    if [ "$use_v6" = "1" ]; then
+      if [ "$last" -eq 1 ]; then
+        if [ "$PORTKNOCK_ALLOW_ALL" = "1" ]; then
+          target_stmt="update @anf_pk_open_ifs { iifname timeout ${PORTKNOCK_OPEN_TIME}s }"
+        else
+          target_stmt="update @anf_pk_allowed_6 { ip6 saddr timeout ${PORTKNOCK_OPEN_TIME}s }"
+        fi
+        if [ -n "$prev6" ]; then
+          rule="meta nfproto ipv6 $match ip6 saddr @$prev6 $target_stmt delete @$prev6 { ip6 saddr }"
+        else
+          rule="meta nfproto ipv6 $match $target_stmt"
+        fi
+        if [ "$PORTKNOCK_LOG" = "1" ]; then
+          rule="$rule limit rate 1/second burst 5 packets log prefix \"ANF:Portknock opened: \" level $LOGLEVEL"
+        fi
+        nft_rule PORTKNOCK_CHAIN "$rule drop"
+      else
+        if [ -n "$prev6" ]; then
+          nft_rule PORTKNOCK_CHAIN "meta nfproto ipv6 $match ip6 saddr @$prev6 update @$set6 { ip6 saddr timeout ${PORTKNOCK_SEQ_TIMEOUT}s } delete @$prev6 { ip6 saddr } drop"
+        else
+          nft_rule PORTKNOCK_CHAIN "meta nfproto ipv6 $match update @$set6 { ip6 saddr timeout ${PORTKNOCK_SEQ_TIMEOUT}s } drop"
+        fi
+      fi
+    fi
+
+    prev4="$set4"
+    prev6="$set6"
+  done
+
+  # Hook the chain into the external input path. Appending (not inserting)
+  # keeps earlier plugin checks (eg. SSH brute-force protection) first.
+  for iface in $jump_ifaces; do
+    [ -n "$iface" ] || continue
+    nft_rule EXT_INPUT_CHAIN "$(nft_if iifname "$iface") jump PORTKNOCK_CHAIN"
+  done
+
+  printf '%s\n' "${INDENT}Portknock - sequence steps: $seq_count, open: $PORTKNOCK_OPEN"
+  if [ "$PORTKNOCK_ALLOW_ALL" = "1" ]; then
+    printf '%s\n' "${INDENT}Portknock - mode: all remote IPs on the external interface (${PORTKNOCK_OPEN_TIME}s)"
+  else
+    case "$use_v4:$use_v6" in
+      1:1) v4_off="IPv4+IPv6" ;;
+      1:0) v4_off="IPv4 only" ;;
+      0:1) v4_off="IPv6 only" ;;
+      *)   v4_off="none" ;;
+    esac
+    printf '%s\n' "${INDENT}Portknock - mode: initiating source only, sides: $v4_off (${PORTKNOCK_OPEN_TIME}s)"
+  fi
+
+  return 0
+}
+
+
+# Plugin stop function
+plugin_stop()
+{
+  # The ANF table (including our sets and chain) is rebuilt on restart/stop
+  return 0
+}
+
+
+portknock_show_set()
+{
+  local set="$1"
+
+  "$NFT" list set inet "$NFT_TABLE" "$set" 2>/dev/null | tr -d '\n' | \
+    sed -n -e 's/^.*elements = { *\([^}]*\)}.*$/\1/p' | tr ',' '\n' | \
+    sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d' | \
+    sed -e 's/^/    /'
+}
+
+
+# Plugin status function
+plugin_status()
+{
+  local mode v4_active v6_active v4_off v6_off iface
+
+  if [ "${PORTKNOCK_CHECK_CONFLICTS:-1}" = "1" ]; then
+    portknock_check_conflicts live || :
+  else
+    PK_SEQ_CONFLICT_IFS_4=""
+    PK_SEQ_CONFLICT_IFS_6=""
+    PK_TARGET_CONFLICT_IFS_4=""
+    PK_TARGET_CONFLICT_IFS_6=""
+    portknock_build_lists
+  fi
+  portknock_warn_blocklists
+
+  if [ "$PORTKNOCK_ALLOW_ALL" = "1" ]; then
+    mode="all remote IPs"
+  else
+    mode="initiating source only"
+
+    v4_active=0
+    v6_active=0
+    for iface in $PK_IFS_LIST; do
+      v4_off=0
+      v6_off=0
+
+      if portknock_iface_in_list "$PK_TARGET_CONFLICT_IFS_4" "$iface" ||
+         portknock_iface_in_list "$PK_SEQ_CONFLICT_IFS_4" "$iface"; then
+        v4_off=1
+      fi
+
+      if [ "${IPV6_SUPPORT:-0}" != "1" ]; then
+        v6_off=1
+      elif portknock_iface_in_list "$PK_TARGET_CONFLICT_IFS_6" "$iface" ||
+           portknock_iface_in_list "$PK_SEQ_CONFLICT_IFS_6" "$iface"; then
+        v6_off=1
+      fi
+
+      [ "$v4_off" = "0" ] && v4_active=1
+      [ "$v6_off" = "0" ] && v6_active=1
+    done
+  fi
+
+  printf '%s\n' "  Mode: $mode"
+  printf '%s\n' "  Target ports: $PORTKNOCK_OPEN"
+  printf '%s\n' "  Open time: ${PORTKNOCK_OPEN_TIME}s, sequence timeout: ${PORTKNOCK_SEQ_TIMEOUT}s"
+  printf '%s\n' "  ------------------------------"
+
+  if [ "$PORTKNOCK_ALLOW_ALL" = "1" ]; then
+    printf '%s\n' "  Open external interface(s):"
+    portknock_show_set anf_pk_open_ifs
+  else
+    if [ "$v4_active" = "1" ]; then
+      printf '%s\n' "  Allowed IPv4 source(s):"
+      portknock_show_set anf_pk_allowed_4
+    else
+      printf '%s\n' "  IPv4 side: disabled"
+    fi
+
+    if [ "${IPV6_SUPPORT:-0}" = "1" ]; then
+      if [ "$v6_active" = "1" ]; then
+        printf '%s\n' "  Allowed IPv6 source(s):"
+        portknock_show_set anf_pk_allowed_6
+      else
+        printf '%s\n' "  IPv6 side: disabled"
+      fi
+    else
+      printf '%s\n' "  IPv6 side: disabled (IPV6_SUPPORT=0)"
+    fi
+  fi
+
+  printf '%s\n' ""
+
+  return 0
+}
+
+
+# Check sanity of eg. environment
+plugin_sanity_check()
+{
+  if ! check_command nft; then
+    printf "\033[40m\033[1;31m${INDENT}ERROR: Required command nft is not available!\033[0m\n" >&2
+    return 1
+  fi
+
+  if ! portknock_validate_config; then
+    return 1
+  fi
+
+  if ! portknock_validate_interfaces; then
+    return 1
+  fi
+
+  portknock_check_config_perms
+
+  return 0
+}
+
+
+############
+# Mainline #
+############
+
+# Check where to find the config file
+CONF_FILE=""
+if [ -n "$PLUGIN_CONF_PATH" ]; then
+  CONF_FILE="$PLUGIN_CONF_PATH/$PLUGIN_CONF_FILE"
+fi
+
+# Preinit to success:
+PLUGIN_RET_VAL=0
+
+# Check if the config file exists
+if [ ! -f "$CONF_FILE" ]; then
+  printf '%s\n' "NOTE: Config file \"$CONF_FILE\" not found!" >&2
+  printf '%s\n' "        Plugin \"$PLUGIN_NAME v$PLUGIN_VERSION\" ignored!" >&2
+else
+  # Source the plugin config file
+  . "$CONF_FILE"
+
+  if [ "${ENABLED:-0}" = "1" ] ||
+     [ -n "$PLUGIN_LOAD_FILE" -a "$PLUGIN_CMD" = "stop" ] ||
+     [ -n "$PLUGIN_LOAD_FILE" -a "$PLUGIN_CMD" = "status" ]; then
+    # Show who we are:
+    echo "${INDENT}$PLUGIN_NAME v$PLUGIN_VERSION"
+
+    # Increment indention
+    INDENT="$INDENT "
+
+    # Only proceed if environment ok
+    if ! plugin_sanity_check; then
+      ENABLED=0
+      PLUGIN_RET_VAL=1
+    else
+      case $PLUGIN_CMD in
+        start|''         ) plugin_start; PLUGIN_RET_VAL=$? ;;
+        stop|stop-restart) plugin_stop; PLUGIN_RET_VAL=$? ;;
+        status           ) plugin_status; PLUGIN_RET_VAL=$? ;;
+        *                ) PLUGIN_RET_VAL=1
+                           printf '%s\n' "** ERROR: Invalid plugin option \"$PLUGIN_CMD\". **" >&2 ;;
+      esac
+    fi
+  fi
+fi

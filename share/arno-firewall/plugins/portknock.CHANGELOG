@@ -1,0 +1,26 @@
+Port Knocking plugin
+====================
+
+1.0   - Initial release.
+      - nftables-native knock sequence (TCP SYN and UDP), no daemon and no
+        log parsing.
+      - Opens configurable TCP/UDP ports on the firewall host for 90 seconds
+        by default (PORTKNOCK_OPEN_TIME).
+      - Source-only opening by default; PORTKNOCK_ALLOW_ALL=1 opens the target
+        ports for every remote IP on the external interface that was knocked.
+        With IPV6_SUPPORT=1, ALLOW_ALL opens both IP families from either
+        family's knock; source-only mode remains per-family.
+      - Full IPv6 support when IPV6_SUPPORT=1, including IPv6 destination
+        address/network matching in conflict checks.
+      - Family-aware conflict handling: with PORTKNOCK_ALLOW_ALL=0 a
+        family-only conflict disables that family's side for the affected
+        interface; with PORTKNOCK_ALLOW_ALL=1 a target conflict disables the
+        plugin and a sequence conflict skips the interface.
+      - Warns about interfering rules from other enabled plugins/custom rules
+        (accept/drop/reject/jump) and unresolved rules.
+      - Validates PORTKNOCK_INTERFACE against EXT_IF.
+      - Per-step timeout, bounded dynamic sets, optional success logging,
+        IPv4 and IPv6.
+      - Config is installed root-only (0600); .netset/BLOCK_HOSTS bans take
+        precedence. Portknock controls new connection admission; established
+        connections are not forcibly closed when the window expires.
