@@ -4,9 +4,6 @@
 PLUGIN_NAME="Port Knocking plugin"
 PLUGIN_VERSION="1.0"
 PLUGIN_CONF_FILE="portknock.conf"
-PORTKNOCK_TIMER_DIR="/run/anf_portknock_timers"
-PORTKNOCK_TIMER_HELPER="$PLUGIN_BIN_PATH/portknock-close-timer"
-PORTKNOCK_CLOSE_DISABLED="/run/anf_portknock_close.disabled"
 #
 # Last changed          : November 11, 2026
 # Requirements          : ANF 3.0.0 (or newer)
@@ -15,11 +12,10 @@ PORTKNOCK_CLOSE_DISABLED="/run/anf_portknock_close.disabled"
 #                         for a limited time after a configured sequence of
 #                         knocks (TCP SYN or UDP packets). Implemented in
 #                         nftables (dynamic sets with timeouts). Successful
-#                         knocks can trigger an rsyslog one-shot timer that
-#                         logs expiry, or a verification warning, when
-#                         PORTKNOCK_LOG=1. Non-monotonic sequence rejection
-#                         and strict reset protection are enabled by default.
-#                         Inspired by knockd.
+#                         knocks can be logged when PORTKNOCK_LOG=1. Closing
+#                         relies on nft set expiry. Non-monotonic sequence
+#                         rejection and strict reset protection are enabled by
+#                         default. Inspired by knockd.
 #
 # Web                   : https://github.com/arno-firewall/anf
 # ------------------------------------------------------------------------------
@@ -1418,33 +1414,6 @@ portknock_validate_config()
 }
 
 
-portknock_timers_stop()
-{
-  local lock pid
-
-  : >"$PORTKNOCK_CLOSE_DISABLED" 2>/dev/null
-
-  if [ -d "$PORTKNOCK_TIMER_DIR" ]; then
-    for lock in "$PORTKNOCK_TIMER_DIR"/*; do
-      [ -d "$lock" ] || continue
-      pid="$(cat "$lock/pid" 2>/dev/null)"
-      case "$pid" in
-        ""|*[!0-9]*) ;;
-        *) kill "$pid" 2>/dev/null ;;
-      esac
-    done
-  fi
-
-  if command -v pkill >/dev/null 2>&1; then
-    pkill -f "$PORTKNOCK_TIMER_HELPER" 2>/dev/null
-  fi
-
-  rm -rf "$PORTKNOCK_TIMER_DIR"
-
-  return 0
-}
-
-
 portknock_add_reset_rules()
 {
   local seq_norm="$1" use_v4="$2" use_v6="$3"
@@ -1495,8 +1464,6 @@ plugin_start()
   local set4 set6 prev4 prev6 match target_stmt rule jump_ifaces
   local use_v4 use_v6 v4_off v6_off reset4 reset6
   local IFS
-
-  portknock_timers_stop
 
   # Check for ports already handled by firewall.conf / hardcoded ANF rules
   if [ "${PORTKNOCK_CHECK_CONFLICTS:-1}" = "1" ]; then
@@ -1789,8 +1756,6 @@ plugin_start()
     printf '%s\n' "${INDENT}Portknock - mode: initiating source only, sides: $v4_off (${PORTKNOCK_OPEN_TIME}s)"
   fi
 
-  rm -f "$PORTKNOCK_CLOSE_DISABLED"
-
   return 0
 }
 
@@ -1798,8 +1763,6 @@ plugin_start()
 # Plugin stop function
 plugin_stop()
 {
-  portknock_timers_stop
-
   # The ANF table (including our sets and chain) is rebuilt on restart/stop
   return 0
 }

@@ -19,15 +19,9 @@ Port Knocking plugin
       - Warns about interfering rules from other enabled plugins/custom rules
         (accept/drop/reject/jump) and unresolved rules.
       - Validates PORTKNOCK_INTERFACE against EXT_IF.
-      - Per-step timeout, bounded dynamic sets, optional open logging and
-        close verification, IPv4 and IPv6.
-      - Successful-knock logging is not rate-limited, so every open can start
-        its close timer. A detached one-shot timer is triggered through rsyslog
-        and uses nft element expiry values; refreshes extend the existing timer.
-      - After expiry the timer waits one second to absorb late refreshes, then
-        verifies the dynamic element is gone and the target accept rule and
-        interface jump still exist. A failed verification logs a warning
-        instead of the normal close message.
+      - Per-step timeout, bounded dynamic sets, optional successful-knock
+        logging, IPv4 and IPv6. Closing relies on the nft set timeout; it is
+        not separately logged.
       - Rejects strictly ascending or descending sequences by default
         (PORTKNOCK_REJECT_MONOTONIC=1); a monotonic sequence disables the plugin.
       - Enables early reset-on-other protection by default
@@ -37,8 +31,6 @@ Port Knocking plugin
         starting over.
       - Conflict checks follow plugin jump targets, including chains such as
         DYNDNS_CHAIN, RPC_CHAIN, SSH_CHK, VPN_INPUT and adaptive-ban chains.
-      - No separate close-log setting; PORTKNOCK_LOG controls open messages,
-        normal close messages, and close-check warnings.
       - Config is installed root-only (0600); .netset/BLOCK_HOSTS bans take
         precedence. Portknock controls new connection admission; established
         connections are not forcibly closed when the window expires.
