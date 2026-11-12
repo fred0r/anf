@@ -28,13 +28,15 @@ Port Knocking plugin
         verifies the dynamic element is gone and the target accept rule and
         interface jump still exist. A failed verification logs a warning
         instead of the normal close message.
-      - Optional strict non-monotonic sequence validation: disabled by default;
-        when enabled, a strictly ascending or descending sequence disables the
-        plugin.
-      - Optional early reset-on-other protection: disabled by default; when
-        enabled, only the next expected sequence port is allowed and any other
-        new TCP/UDP packet resets the in-progress sequence. A short suppression
-        marker prevents the reset source from immediately starting over.
+      - Rejects strictly ascending or descending sequences by default
+        (PORTKNOCK_REJECT_MONOTONIC=1); a monotonic sequence disables the plugin.
+      - Enables early reset-on-other protection by default
+        (PORTKNOCK_STRICT=1); only the next expected sequence port is allowed
+        and any other new TCP/UDP packet resets the in-progress sequence. A
+        short suppression marker prevents the reset source from immediately
+        starting over.
+      - Conflict checks follow plugin jump targets, including chains such as
+        DYNDNS_CHAIN, RPC_CHAIN, SSH_CHK, VPN_INPUT and adaptive-ban chains.
       - No separate close-log setting; PORTKNOCK_LOG controls open messages,
         normal close messages, and close-check warnings.
       - Config is installed root-only (0600); .netset/BLOCK_HOSTS bans take
