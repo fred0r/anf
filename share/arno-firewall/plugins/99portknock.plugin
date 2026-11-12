@@ -5,6 +5,11 @@ PLUGIN_NAME="Port Knocking plugin"
 PLUGIN_VERSION="1.0"
 PLUGIN_CONF_FILE="portknock.conf"
 PK_SET_SIZE=1024
+PK_LINK_CACHE_READY=0
+PK_LINK_CACHE=""
+PK_WARN_SEEN_CHAINS=""
+PK_WARN_INDEX=""
+PK_WARN_PORT_NUMS=""
 #
 # Last changed          : November 12, 2026
 # Requirements          : ANF 3.0.0 (or newer)
@@ -91,25 +96,14 @@ portknock_require_uint()
 }
 
 
-portknock_norm_uint()
-{
-  local val="$1"
-
-  while [ "${val#0}" != "$val" ] && [ ${#val} -gt 1 ]; do
-    val="${val#0}"
-  done
-
-  printf '%s' "$val"
-}
-
-
 portknock_port_match()
 {
-  local port list item start end
+  local port="$1" list="$2" item start end
   local IFS=', '
 
-  port="$(portknock_norm_uint "$1")"
-  list="$2"
+  while [ "${port#0}" != "$port" ] && [ ${#port} -gt 1 ]; do
+    port="${port#0}"
+  done
 
   for item in $list; do
     [ -n "$item" ] || continue
@@ -120,12 +114,18 @@ portknock_port_match()
         case "$item" in
           *:*) start="${item%%:*}"; end="${item#*:}" ;;
         esac
-        start="$(portknock_norm_uint "$start")"
-        end="$(portknock_norm_uint "$end")"
+        while [ "${start#0}" != "$start" ] && [ ${#start} -gt 1 ]; do
+          start="${start#0}"
+        done
+        while [ "${end#0}" != "$end" ] && [ ${#end} -gt 1 ]; do
+          end="${end#0}"
+        done
         [ "$port" -ge "$start" ] 2>/dev/null && [ "$port" -le "$end" ] 2>/dev/null && return 0
         ;;
       *)
-        item="$(portknock_norm_uint "$item")"
+        while [ "${item#0}" != "$item" ] && [ ${#item} -gt 1 ]; do
+          item="${item#0}"
+        done
         [ "$port" = "$item" ] && return 0
         ;;
     esac
@@ -957,6 +957,7 @@ portknock_resolve_port_set()
   case "$set" in @*) set="${set#@}" ;; esac
   [ -n "$set" ] || return 2
   [ -n "${NFT:-}" ] || return 2
+  [ "${PK_WARN_SOURCE:-}" = "batch" ] && return 2
 
   type="$("$NFT" list set inet "$NFT_TABLE" "$set" 2>/dev/null | awk '/^[[:space:]]*type / { print $2; exit }')"
   [ "$type" = "inet_service" ] || return 2
@@ -976,6 +977,7 @@ portknock_resolve_iface_set()
   case "$set" in @*) set="${set#@}" ;; esac
   [ -n "$set" ] || return 2
   [ -n "${NFT:-}" ] || return 2
+  [ "${PK_WARN_SOURCE:-}" = "batch" ] && return 2
 
   type="$("$NFT" list set inet "$NFT_TABLE" "$set" 2>/dev/null | awk '/^[[:space:]]*type / { print $2; exit }')"
   [ "$type" = "ifname" ] || return 2
@@ -1020,7 +1022,12 @@ portknock_resolve_iif()
     ""|*[!0-9]*) printf '%s' "$idx"; return 0 ;;
   esac
 
-  name="$(ip -o link show 2>/dev/null | awk -v i="$idx" '$1 == i":" { n=$2; sub(/:$/, "", n); print n; exit }')"
+  if [ "${PK_LINK_CACHE_READY:-0}" != "1" ]; then
+    PK_LINK_CACHE="$(ip -o link show 2>/dev/null)"
+    PK_LINK_CACHE_READY=1
+  fi
+
+  name="$(printf '%s\n' "$PK_LINK_CACHE" | awk -v i="$idx" '$1 == i":" { n=$2; sub(/:$/, "", n); print n; exit }')"
   [ -n "$name" ] || return 1
   printf '%s' "$name"
 }
@@ -1050,31 +1057,75 @@ portknock_line_ports_match()
 }
 
 
-portknock_line_verdict()
+portknock_strip_quotes_set()
 {
-  local line="$1"
+  local text="$1" out="" part
 
-  case " $line " in
-    *" accept "*) printf 'accept' ;;
-    *" drop "*) printf 'drop' ;;
-    *" reject "*) printf 'reject' ;;
-    *" jump "*) printf 'jump' ;;
-    *" goto "*) printf 'jump' ;;
-    *) return 1 ;;
-  esac
+  while :; do
+    case "$text" in
+      *'"'*)
+        part="${text%%\"*}"
+        out="$out$part"
+        text="${text#*\"}"
+        case "$text" in
+          *'"'*) text="${text#*\"}" ;;
+          *) return 1 ;;
+        esac
+        ;;
+      *)
+        PK_STRIPPED="$out$text"
+        return 0
+        ;;
+    esac
+  done
 }
 
 
 portknock_warn_line()
 {
-  local chain="$1" line="$2" clean verdict kif kind items item proto port ps msg has_dport
+  local chain="$1" line="$2" clean verdict kif kind items item proto port ps msg has_dport spec
 
   case "$line" in
     *'comment "OPEN_TCP"'*|*'comment "OPEN_UDP"'*|*'comment "HOST_OPEN_TCP"'*|*'comment "HOST_OPEN_UDP"'*|*'comment "FULL_ACCESS_HOSTS"'*|*'comment "OPEN_IP"'*|*'comment "HOST_OPEN_IP"'*|*'comment "portknock"'*) return 0 ;;
   esac
 
-  clean="$(printf '%s' "$line" | sed 's/"[^"]*"//g')"
-  verdict="$(portknock_line_verdict "$clean")" || return 0
+  case " $line " in
+    *" accept "*|*" drop "*|*" reject "*|*" jump "*|*" goto "*) ;;
+    *) return 0 ;;
+  esac
+
+  case "$line" in
+    *" dport "*)
+      spec="${line#* dport }"
+      case "$spec" in
+        ""|*[!0-9]*) ;;
+        *)
+          case " ${PK_WARN_PORT_NUMS:-} " in
+            *" $spec "*) ;;
+            *) return 0 ;;
+          esac
+          ;;
+      esac
+      ;;
+  esac
+
+  case "$line" in
+    *'"'*)
+      if ! portknock_strip_quotes_set "$line"; then
+        PK_STRIPPED="$line"
+      fi
+      clean="$PK_STRIPPED"
+      ;;
+    *) clean="$line" ;;
+  esac
+
+  case " $clean " in
+    *" accept "*) verdict="accept" ;;
+    *" drop "*) verdict="drop" ;;
+    *" reject "*) verdict="reject" ;;
+    *" jump "*|*" goto "*) verdict="jump" ;;
+    *) return 0 ;;
+  esac
 
   if [ "${IPV6_SUPPORT:-0}" != "1" ]; then
     case "$clean" in
@@ -1144,8 +1195,10 @@ portknock_jump_target()
 {
   local clean rest target
 
-  clean="$(printf '%s' "$1" | sed 's/"[^"]*"//g')"
-  clean=" $clean "
+  if ! portknock_strip_quotes_set "$1"; then
+    PK_STRIPPED="$1"
+  fi
+  clean=" $PK_STRIPPED "
   case "$clean" in
     *" jump "*) rest="${clean#* jump }" ;;
     *" goto "*) rest="${clean#* goto }" ;;
@@ -1174,7 +1227,7 @@ portknock_chain_is_base()
 portknock_warn_chain()
 {
   local chain="$1" depth="$2" visited="$3" root="$4"
-  local line scan_chain rest table rule target
+  local line scan_chain rest table rule target output
 
   [ "$depth" -le 12 ] || return 0
   if [ "$root" != "1" ] && portknock_chain_is_base "$chain"; then
@@ -1186,20 +1239,47 @@ portknock_warn_chain()
   esac
   visited="$visited $chain"
 
+  case " ${PK_WARN_SEEN_CHAINS:-} " in
+    *" $chain "*) return 0 ;;
+  esac
+  PK_WARN_SEEN_CHAINS="$PK_WARN_SEEN_CHAINS${PK_WARN_SEEN_CHAINS:+ }$chain"
+
   if [ "$PK_WARN_SOURCE" = "live" ]; then
-    "$NFT" list chain inet "$NFT_TABLE" "$chain" 2>/dev/null | \
-      while IFS= read -r line; do
-        rule="${line#"${line%%[![:space:]]*}"}"
-        case "$rule" in
-          ""|table\ *|chain\ *|\}|*"type filter hook "*) continue ;;
-        esac
-        case "$rule" in
-          *'comment "portknock"'*) continue ;;
-        esac
-        portknock_warn_line "$chain" "$rule"
-        target="$(portknock_jump_target "$rule")" || continue
-        portknock_warn_chain "$target" $((depth + 1)) "$visited" 0
-      done
+    output="$("$NFT" list chain inet "$NFT_TABLE" "$chain" 2>/dev/null)"
+    while IFS= read -r line; do
+      rule="${line#"${line%%[![:space:]]*}"}"
+      case "$rule" in
+        ""|table\ *|chain\ *|\}|*"type filter hook "*) continue ;;
+      esac
+      case "$rule" in
+        *'comment "portknock"'*) continue ;;
+      esac
+      portknock_warn_line "$chain" "$rule"
+      case "$rule" in
+        *" jump "*|*" goto "*) ;;
+        *) continue ;;
+      esac
+      target="$(portknock_jump_target "$rule")" || continue
+      portknock_warn_chain "$target" $((depth + 1)) "$visited" 0
+    done <<EOF
+$output
+EOF
+    return 0
+  fi
+
+  if [ -n "${PK_WARN_INDEX:-}" ]; then
+    if [ ! -r "$PK_WARN_INDEX/$chain" ]; then
+      return 0
+    fi
+    while IFS= read -r rule; do
+      portknock_warn_line "$chain" "$rule"
+      case " $rule " in
+        *" jump "*|*" goto "*) ;;
+        *) continue ;;
+      esac
+      target="$(portknock_jump_target "$rule")" || continue
+      portknock_warn_chain "$target" $((depth + 1)) "$visited" 0
+    done < "$PK_WARN_INDEX/$chain"
     return 0
   fi
 
@@ -1219,6 +1299,10 @@ portknock_warn_chain()
       *'comment "portknock"'*) continue ;;
     esac
     portknock_warn_line "$scan_chain" "$rule"
+    case " $rule " in
+      *" jump "*|*" goto "*) ;;
+      *) continue ;;
+    esac
     target="$(portknock_jump_target "$rule")" || continue
     portknock_warn_chain "$target" $((depth + 1)) "$visited" 0
   done < "$NFT_BATCH_FILE"
@@ -1227,10 +1311,20 @@ portknock_warn_chain()
 
 portknock_warn_other_rules()
 {
-  local chain src
+  local chain src item port
 
   [ -n "${NFT:-}" ] || return 0
   [ -n "$PK_IFS_LIST" ] || return 0
+
+  if [ -z "${PK_WARN_PORT_NUMS:-}" ]; then
+    for item in $PK_SEQ_ITEMS $PK_OPEN_ITEMS; do
+      port="${item#*/}"
+      case " $PK_WARN_PORT_NUMS " in
+        *" $port "*) ;;
+        *) PK_WARN_PORT_NUMS="$PK_WARN_PORT_NUMS${PK_WARN_PORT_NUMS:+ }$port" ;;
+      esac
+    done
+  fi
 
   src="${PK_WARN_SOURCE:-batch}"
 
@@ -1247,9 +1341,31 @@ portknock_warn_other_rules()
     return 0
   fi
 
+  PK_WARN_INDEX="$(mktemp -d "${TMPDIR:-/tmp}/anf-portknock-chains.XXXXXX" 2>/dev/null)" || PK_WARN_INDEX=""
+  if [ -n "$PK_WARN_INDEX" ]; then
+    if ! awk -v dir="$PK_WARN_INDEX" -v table="$NFT_TABLE" '
+      / rule inet / {
+        line = $0
+        sub(/^.* rule inet /, "", line)
+        split(line, fields, " ")
+        if (fields[1] != table) next
+        chain = fields[2]
+        sub(/^[^ ]+ [^ ]+ /, "", line)
+        print line > (dir "/" chain)
+      }' "$NFT_BATCH_FILE"; then
+      rm -rf "$PK_WARN_INDEX"
+      PK_WARN_INDEX=""
+    fi
+  fi
+
   for chain in $PK_INPUT_CHAINS; do
     portknock_warn_chain "$chain" 0 "" 1
   done
+
+  if [ -n "$PK_WARN_INDEX" ]; then
+    rm -rf "$PK_WARN_INDEX"
+    PK_WARN_INDEX=""
+  fi
 }
 
 
@@ -1262,6 +1378,14 @@ portknock_check_conflicts()
   PK_TARGET_CONFLICT_IFS_4=""
   PK_TARGET_CONFLICT_IFS_6=""
   PK_WARN_SOURCE="$mode"
+  PK_LINK_CACHE_READY=0
+  PK_LINK_CACHE=""
+  PK_WARN_SEEN_CHAINS=""
+  PK_WARN_PORT_NUMS=""
+  if [ -n "${PK_WARN_INDEX:-}" ]; then
+    rm -rf "${PK_WARN_INDEX}"
+  fi
+  PK_WARN_INDEX=""
   PK_INPUT_CHAINS="INPUT INPUT_CHAIN EXT_INPUT_CHAIN INT_INPUT_CHAIN DMZ_INPUT_CHAIN POST_INPUT_CHAIN"
   PK_BASE_CHAINS="INPUT INPUT_CHAIN EXT_INPUT_CHAIN INT_INPUT_CHAIN DMZ_INPUT_CHAIN POST_INPUT_CHAIN POST_INPUT_DROP_CHAIN VALID_CHK RESERVED_NET_CHK SPOOF_CHK HOST_BLOCK_SRC HOST_BLOCK_DST LINK_LOCAL_DROP EXT_BROADCAST_CHAIN EXT_MULTICAST_CHAIN EXT_ICMP_FLOOD_CHAIN BASE_INPUT_CHAIN PORTKNOCK_CHAIN PORTKNOCK_RESET_CHAIN"
 
