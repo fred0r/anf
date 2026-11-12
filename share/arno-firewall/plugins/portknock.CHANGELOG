@@ -24,11 +24,11 @@ Port Knocking plugin
         not separately logged.
       - Rejects strictly ascending or descending sequences by default
         (PORTKNOCK_REJECT_MONOTONIC=1); a monotonic sequence disables the plugin.
-      - Enables early reset-on-other protection by default
-        (PORTKNOCK_STRICT=1); only the next expected sequence port is allowed
-        and any other new TCP/UDP packet resets the in-progress sequence. A
-        short suppression marker prevents the reset source from immediately
-        starting over.
+      - Always enforces strict sequence ordering: only the next expected
+        sequence port is allowed and any other new TCP/UDP packet resets the
+        in-progress sequence. Without this, unrelated scan traffic between
+        steps is ignored and a broad portscan could accidentally open the
+        target. A short suppression marker prevents immediate restart.
       - Conflict checks follow plugin jump targets, including chains such as
         DYNDNS_CHAIN, RPC_CHAIN, SSH_CHK, VPN_INPUT and adaptive-ban chains.
       - Config is installed root-only (0600); .netset/BLOCK_HOSTS bans take

@@ -14,8 +14,8 @@ PLUGIN_CONF_FILE="portknock.conf"
 #                         nftables (dynamic sets with timeouts). Successful
 #                         knocks can be logged when PORTKNOCK_LOG=1. Closing
 #                         relies on nft set expiry. Non-monotonic sequence
-#                         rejection and strict reset protection are enabled by
-#                         default. Inspired by knockd.
+#                         rejection and strict reset protection are always
+#                         enforced. Inspired by knockd.
 #
 # Web                   : https://github.com/arno-firewall/anf
 # ------------------------------------------------------------------------------
@@ -1358,12 +1358,6 @@ portknock_validate_config()
        return 1 ;;
   esac
 
-  case "${PORTKNOCK_STRICT:-1}" in
-    0|1) ;;
-    *) printf '%s\n' "** ERROR: PORTKNOCK_STRICT must be 0 or 1. **" >&2
-       return 1 ;;
-  esac
-
   if [ "${PORTKNOCK_REJECT_MONOTONIC:-1}" = "1" ]; then
     asc=1
     desc=1
@@ -1569,19 +1563,20 @@ plugin_start()
     fi
   fi
 
+  # Strict ordering is always enforced: without it, unrelated packets between
+  # knock steps are ignored and a broad portscan could accidentally hit the
+  # sequence in order and open the target.
   reset4=""
   reset6=""
-  if [ "${PORTKNOCK_STRICT:-1}" = "1" ]; then
-    if [ "$use_v4" = "1" ]; then
-      nft_cmd "add set inet $NFT_TABLE anf_pk_reset_4 { type ipv4_addr; flags dynamic,timeout; timeout 1s; size ${PORTKNOCK_MAX_CLIENTS}; }"
-      reset4="ip saddr != @anf_pk_reset_4"
-    fi
-    if [ "$use_v6" = "1" ]; then
-      nft_cmd "add set inet $NFT_TABLE anf_pk_reset_6 { type ipv6_addr; flags dynamic,timeout; timeout 1s; size ${PORTKNOCK_MAX_CLIENTS}; }"
-      reset6="ip6 saddr != @anf_pk_reset_6"
-    fi
-    nft_chain PORTKNOCK_RESET_CHAIN
+  if [ "$use_v4" = "1" ]; then
+    nft_cmd "add set inet $NFT_TABLE anf_pk_reset_4 { type ipv4_addr; flags dynamic,timeout; timeout 1s; size ${PORTKNOCK_MAX_CLIENTS}; }"
+    reset4="ip saddr != @anf_pk_reset_4"
   fi
+  if [ "$use_v6" = "1" ]; then
+    nft_cmd "add set inet $NFT_TABLE anf_pk_reset_6 { type ipv6_addr; flags dynamic,timeout; timeout 1s; size ${PORTKNOCK_MAX_CLIENTS}; }"
+    reset6="ip6 saddr != @anf_pk_reset_6"
+  fi
+  nft_chain PORTKNOCK_RESET_CHAIN
 
   nft_chain PORTKNOCK_CHAIN
 
@@ -1728,13 +1723,11 @@ plugin_start()
     prev6="$set6"
   done
 
-  if [ "${PORTKNOCK_STRICT:-1}" = "1" ]; then
-    portknock_add_reset_rules "$seq_norm" "$use_v4" "$use_v6"
-    for iface in $jump_ifaces; do
-      [ -n "$iface" ] || continue
-      nft_insert INPUT "$(nft_if iifname "$iface") jump PORTKNOCK_RESET_CHAIN"
-    done
-  fi
+  portknock_add_reset_rules "$seq_norm" "$use_v4" "$use_v6"
+  for iface in $jump_ifaces; do
+    [ -n "$iface" ] || continue
+    nft_insert INPUT "$(nft_if iifname "$iface") jump PORTKNOCK_RESET_CHAIN"
+  done
 
   # Hook the chain into the external input path. Appending (not inserting)
   # keeps earlier plugin checks (eg. SSH brute-force protection) first.
