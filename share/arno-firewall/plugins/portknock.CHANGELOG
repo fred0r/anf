@@ -23,16 +23,21 @@ Port Knocking plugin
         logging, IPv4 and IPv6. Closing relies on the nft set timeout; it is
         not separately logged.
       - Always enforces strict sequence ordering: only the next expected
-        sequence port is allowed and any other new TCP/UDP packet resets the
-        in-progress sequence. Without this, unrelated scan traffic between
-        steps is ignored and a broad portscan could accidentally open the
-        target. A short suppression marker prevents immediate restart.
+        sequence port is allowed and any other new TCP/UDP packet on a
+        portknock interface resets the in-progress sequence. Without this,
+        unrelated scan traffic between steps is ignored and a broad portscan
+        could accidentally open the target. A short suppression marker
+        prevents immediate restart.
       - Relies on strict reset instead of rejecting monotonic sequences.
         Non-monotonic ordering is still recommended because a targeted scan
         hitting only the sequence ports in order is indistinguishable, and
         because other implementations may lack equivalent reset behavior.
-      - Conflict checks follow plugin jump targets, including chains such as
-        DYNDNS_CHAIN, RPC_CHAIN, SSH_CHK, VPN_INPUT and adaptive-ban chains.
+      - Always enables conflict checks against firewall.conf, hardcoded rules,
+        and plugin jump targets, including DYNDNS_CHAIN, RPC_CHAIN, SSH_CHK,
+        VPN_INPUT and adaptive-ban chains. The old PORTKNOCK_CHECK_CONFLICTS
+        setting is ignored.
+      - Dynamic nft set sizes are fixed internally at 1024 entries. The old
+        PORTKNOCK_MAX_CLIENTS and PORTKNOCK_STAGE_SIZE settings are ignored.
       - Config is installed root-only (0600); .netset/BLOCK_HOSTS bans take
         precedence. Portknock controls new connection admission; established
         connections are not forcibly closed when the window expires.
