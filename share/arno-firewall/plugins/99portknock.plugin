@@ -13,9 +13,9 @@ PLUGIN_CONF_FILE="portknock.conf"
 #                         knocks (TCP SYN or UDP packets). Implemented in
 #                         nftables (dynamic sets with timeouts). Successful
 #                         knocks can be logged when PORTKNOCK_LOG=1. Closing
-#                         relies on nft set expiry. Non-monotonic sequence
-#                         rejection and strict reset protection are always
-#                         enforced. Inspired by knockd.
+#                         relies on nft set expiry. Strict reset protection is
+#                         always enforced; use a non-monotonic sequence order.
+#                         Inspired by knockd.
 #
 # Web                   : https://github.com/arno-firewall/anf
 # ------------------------------------------------------------------------------
@@ -1299,8 +1299,7 @@ portknock_check_config_perms()
 
 portknock_validate_config()
 {
-  local item seq_count=0 open_count=0 seq_list=" " open_list=" " seq_ports="" IFS
-  local prev_port="" asc desc have_pair
+  local item seq_count=0 open_count=0 seq_list=" " open_list=" " IFS
 
   if [ -z "$PORTKNOCK_SEQUENCE" ]; then
     printf '%s\n' "** ERROR: PORTKNOCK_SEQUENCE is empty. **" >&2
@@ -1320,7 +1319,6 @@ portknock_validate_config()
     fi
     seq_count=$((seq_count + 1))
     seq_list="$seq_list$PK_PROTO/$PK_PORT "
-    seq_ports="$seq_ports${seq_ports:+ }$PK_PORT"
   done
 
   for item in ${PORTKNOCK_OPEN:-}; do
@@ -1351,31 +1349,6 @@ portknock_validate_config()
         ;;
     esac
   done
-
-  case "${PORTKNOCK_REJECT_MONOTONIC:-1}" in
-    0|1) ;;
-    *) printf '%s\n' "** ERROR: PORTKNOCK_REJECT_MONOTONIC must be 0 or 1. **" >&2
-       return 1 ;;
-  esac
-
-  if [ "${PORTKNOCK_REJECT_MONOTONIC:-1}" = "1" ]; then
-    asc=1
-    desc=1
-    have_pair=0
-    for item in $seq_ports; do
-      if [ -n "$prev_port" ]; then
-        have_pair=1
-        [ "$item" -gt "$prev_port" ] || asc=0
-        [ "$item" -lt "$prev_port" ] || desc=0
-      fi
-      prev_port="$item"
-    done
-
-    if [ "$have_pair" = "1" ] && { [ "$asc" = "1" ] || [ "$desc" = "1" ]; }; then
-      printf '%s\n' "** ERROR: PORTKNOCK_SEQUENCE is monotonic; PORTKNOCK_REJECT_MONOTONIC=1. **" >&2
-      return 1
-    fi
-  fi
 
   case "$PORTKNOCK_ALLOW_ALL" in
     0|1) ;;
