@@ -16,7 +16,9 @@ PORTKNOCK_CLOSE_DISABLED="/run/anf_portknock_close.disabled"
 #                         nftables (dynamic sets with timeouts). Successful
 #                         knocks can trigger an rsyslog one-shot timer that
 #                         logs expiry, or a verification warning, when
-#                         PORTKNOCK_LOG=1. Inspired by knockd.
+#                         PORTKNOCK_LOG=1. Optional non-monotonic sequence
+#                         validation and reset-on-other protection are
+#                         configurable. Inspired by knockd.
 #
 # Web                   : https://github.com/arno-firewall/anf
 # ------------------------------------------------------------------------------
@@ -1234,7 +1236,8 @@ portknock_check_config_perms()
 
 portknock_validate_config()
 {
-  local item seq_count=0 open_count=0 seq_list=" " open_list=" " IFS
+  local item seq_count=0 open_count=0 seq_list=" " open_list=" " seq_ports="" IFS
+  local prev_port="" asc desc have_pair
 
   if [ -z "$PORTKNOCK_SEQUENCE" ]; then
     printf '%s\n' "** ERROR: PORTKNOCK_SEQUENCE is empty. **" >&2
@@ -1254,6 +1257,7 @@ portknock_validate_config()
     fi
     seq_count=$((seq_count + 1))
     seq_list="$seq_list$PK_PROTO/$PK_PORT "
+    seq_ports="$seq_ports${seq_ports:+ }$PK_PORT"
   done
 
   for item in ${PORTKNOCK_OPEN:-}; do
@@ -1284,6 +1288,37 @@ portknock_validate_config()
         ;;
     esac
   done
+
+  case "${PORTKNOCK_REQUIRE_NON_MONOTONIC:-0}" in
+    0|1) ;;
+    *) printf '%s\n' "** ERROR: PORTKNOCK_REQUIRE_NON_MONOTONIC must be 0 or 1. **" >&2
+       return 1 ;;
+  esac
+
+  case "${PORTKNOCK_STRICT:-0}" in
+    0|1) ;;
+    *) printf '%s\n' "** ERROR: PORTKNOCK_STRICT must be 0 or 1. **" >&2
+       return 1 ;;
+  esac
+
+  if [ "${PORTKNOCK_REQUIRE_NON_MONOTONIC:-0}" = "1" ]; then
+    asc=1
+    desc=1
+    have_pair=0
+    for item in $seq_ports; do
+      if [ -n "$prev_port" ]; then
+        have_pair=1
+        [ "$item" -gt "$prev_port" ] || asc=0
+        [ "$item" -lt "$prev_port" ] || desc=0
+      fi
+      prev_port="$item"
+    done
+
+    if [ "$have_pair" = "1" ] && { [ "$asc" = "1" ] || [ "$desc" = "1" ]; }; then
+      printf '%s\n' "** ERROR: PORTKNOCK_SEQUENCE is monotonic; PORTKNOCK_REQUIRE_NON_MONOTONIC=1. **" >&2
+      return 1
+    fi
+  fi
 
   case "$PORTKNOCK_ALLOW_ALL" in
     0|1) ;;
@@ -1343,12 +1378,55 @@ portknock_timers_stop()
 }
 
 
+portknock_add_reset_rules()
+{
+  local seq_norm="$1" use_v4="$2" use_v6="$3"
+  local stage=1 next proto port set4 set6
+
+  set -- $seq_norm
+  while [ "$#" -gt 1 ]; do
+    next="$2"
+    portknock_parse_item "$next" || return 0
+    proto="$PK_PROTO"
+    port="$PK_PORT"
+
+    set4=""
+    set6=""
+    [ "$use_v4" = "1" ] && set4="anf_pk_stage${stage}_4"
+    [ "$use_v6" = "1" ] && set6="anf_pk_stage${stage}_6"
+
+    if [ -n "$set4" ]; then
+      if [ "$proto" = "tcp" ]; then
+        nft_rule PORTKNOCK_RESET_CHAIN "meta nfproto ipv4 meta l4proto tcp ct state new tcp dport != $port ip saddr @$set4 update @anf_pk_reset_4 { ip saddr timeout 1s } delete @$set4 { ip saddr }"
+        nft_rule PORTKNOCK_RESET_CHAIN "meta nfproto ipv4 meta l4proto udp ct state new ip saddr @$set4 update @anf_pk_reset_4 { ip saddr timeout 1s } delete @$set4 { ip saddr }"
+      else
+        nft_rule PORTKNOCK_RESET_CHAIN "meta nfproto ipv4 meta l4proto tcp ct state new ip saddr @$set4 update @anf_pk_reset_4 { ip saddr timeout 1s } delete @$set4 { ip saddr }"
+        nft_rule PORTKNOCK_RESET_CHAIN "meta nfproto ipv4 meta l4proto udp ct state new udp dport != $port ip saddr @$set4 update @anf_pk_reset_4 { ip saddr timeout 1s } delete @$set4 { ip saddr }"
+      fi
+    fi
+
+    if [ -n "$set6" ]; then
+      if [ "$proto" = "tcp" ]; then
+        nft_rule PORTKNOCK_RESET_CHAIN "meta nfproto ipv6 meta l4proto tcp ct state new tcp dport != $port ip6 saddr @$set6 update @anf_pk_reset_6 { ip6 saddr timeout 1s } delete @$set6 { ip6 saddr }"
+        nft_rule PORTKNOCK_RESET_CHAIN "meta nfproto ipv6 meta l4proto udp ct state new ip6 saddr @$set6 update @anf_pk_reset_6 { ip6 saddr timeout 1s } delete @$set6 { ip6 saddr }"
+      else
+        nft_rule PORTKNOCK_RESET_CHAIN "meta nfproto ipv6 meta l4proto tcp ct state new ip6 saddr @$set6 update @anf_pk_reset_6 { ip6 saddr timeout 1s } delete @$set6 { ip6 saddr }"
+        nft_rule PORTKNOCK_RESET_CHAIN "meta nfproto ipv6 meta l4proto udp ct state new udp dport != $port ip6 saddr @$set6 update @anf_pk_reset_6 { ip6 saddr timeout 1s } delete @$set6 { ip6 saddr }"
+      fi
+    fi
+
+    shift
+    stage=$((stage + 1))
+  done
+}
+
+
 # Plugin start function
 plugin_start()
 {
-  local item iface proto port seq_count stage last tcp_ports udp_ports
+  local item iface proto port seq_count stage last tcp_ports udp_ports seq_norm
   local set4 set6 prev4 prev6 match target_stmt rule jump_ifaces
-  local use_v4 use_v6 v4_off v6_off
+  local use_v4 use_v6 v4_off v6_off reset4 reset6
   local IFS
 
   portknock_timers_stop
@@ -1388,10 +1466,13 @@ plugin_start()
     esac
   done
 
-  # Count the sequence steps
+  # Count and normalize the sequence steps
   seq_count=0
+  seq_norm=""
   for item in ${PORTKNOCK_SEQUENCE:-}; do
     seq_count=$((seq_count + 1))
+    portknock_parse_item "$item" || continue
+    seq_norm="$seq_norm${seq_norm:+ }$PK_PROTO/$PK_PORT"
   done
 
   # Determine which families and interfaces remain usable
@@ -1452,6 +1533,20 @@ plugin_start()
     if [ "$use_v6" = "1" ]; then
       nft_cmd "add set inet $NFT_TABLE anf_pk_allowed_6 { type ipv6_addr; flags dynamic,timeout; timeout ${PORTKNOCK_OPEN_TIME}s; size ${PORTKNOCK_MAX_CLIENTS}; }"
     fi
+  fi
+
+  reset4=""
+  reset6=""
+  if [ "${PORTKNOCK_STRICT:-0}" = "1" ]; then
+    if [ "$use_v4" = "1" ]; then
+      nft_cmd "add set inet $NFT_TABLE anf_pk_reset_4 { type ipv4_addr; flags dynamic,timeout; timeout 1s; size ${PORTKNOCK_MAX_CLIENTS}; }"
+      reset4="ip saddr != @anf_pk_reset_4"
+    fi
+    if [ "$use_v6" = "1" ]; then
+      nft_cmd "add set inet $NFT_TABLE anf_pk_reset_6 { type ipv6_addr; flags dynamic,timeout; timeout 1s; size ${PORTKNOCK_MAX_CLIENTS}; }"
+      reset6="ip6 saddr != @anf_pk_reset_6"
+    fi
+    nft_chain PORTKNOCK_RESET_CHAIN
   fi
 
   nft_chain PORTKNOCK_CHAIN
@@ -1552,9 +1647,9 @@ plugin_start()
           target_stmt="update @anf_pk_allowed_4 { ip saddr timeout ${PORTKNOCK_OPEN_TIME}s }"
         fi
         if [ -n "$prev4" ]; then
-          rule="meta nfproto ipv4 $match ip saddr @$prev4 $target_stmt delete @$prev4 { ip saddr }"
+          rule="meta nfproto ipv4 $reset4 $match ip saddr @$prev4 $target_stmt delete @$prev4 { ip saddr }"
         else
-          rule="meta nfproto ipv4 $match $target_stmt"
+          rule="meta nfproto ipv4 $reset4 $match $target_stmt"
         fi
         if [ "$PORTKNOCK_LOG" = "1" ]; then
           rule="$rule log prefix \"ANF:Portknock opened: \" level $LOGLEVEL"
@@ -1562,9 +1657,9 @@ plugin_start()
         nft_rule PORTKNOCK_CHAIN "$rule drop"
       else
         if [ -n "$prev4" ]; then
-          nft_rule PORTKNOCK_CHAIN "meta nfproto ipv4 $match ip saddr @$prev4 update @$set4 { ip saddr timeout ${PORTKNOCK_SEQ_TIMEOUT}s } delete @$prev4 { ip saddr } drop"
+          nft_rule PORTKNOCK_CHAIN "meta nfproto ipv4 $reset4 $match ip saddr @$prev4 update @$set4 { ip saddr timeout ${PORTKNOCK_SEQ_TIMEOUT}s } delete @$prev4 { ip saddr } drop"
         else
-          nft_rule PORTKNOCK_CHAIN "meta nfproto ipv4 $match update @$set4 { ip saddr timeout ${PORTKNOCK_SEQ_TIMEOUT}s } drop"
+          nft_rule PORTKNOCK_CHAIN "meta nfproto ipv4 $reset4 $match update @$set4 { ip saddr timeout ${PORTKNOCK_SEQ_TIMEOUT}s } drop"
         fi
       fi
     fi
@@ -1578,9 +1673,9 @@ plugin_start()
           target_stmt="update @anf_pk_allowed_6 { ip6 saddr timeout ${PORTKNOCK_OPEN_TIME}s }"
         fi
         if [ -n "$prev6" ]; then
-          rule="meta nfproto ipv6 $match ip6 saddr @$prev6 $target_stmt delete @$prev6 { ip6 saddr }"
+          rule="meta nfproto ipv6 $reset6 $match ip6 saddr @$prev6 $target_stmt delete @$prev6 { ip6 saddr }"
         else
-          rule="meta nfproto ipv6 $match $target_stmt"
+          rule="meta nfproto ipv6 $reset6 $match $target_stmt"
         fi
         if [ "$PORTKNOCK_LOG" = "1" ]; then
           rule="$rule log prefix \"ANF:Portknock opened: \" level $LOGLEVEL"
@@ -1588,9 +1683,9 @@ plugin_start()
         nft_rule PORTKNOCK_CHAIN "$rule drop"
       else
         if [ -n "$prev6" ]; then
-          nft_rule PORTKNOCK_CHAIN "meta nfproto ipv6 $match ip6 saddr @$prev6 update @$set6 { ip6 saddr timeout ${PORTKNOCK_SEQ_TIMEOUT}s } delete @$prev6 { ip6 saddr } drop"
+          nft_rule PORTKNOCK_CHAIN "meta nfproto ipv6 $reset6 $match ip6 saddr @$prev6 update @$set6 { ip6 saddr timeout ${PORTKNOCK_SEQ_TIMEOUT}s } delete @$prev6 { ip6 saddr } drop"
         else
-          nft_rule PORTKNOCK_CHAIN "meta nfproto ipv6 $match update @$set6 { ip6 saddr timeout ${PORTKNOCK_SEQ_TIMEOUT}s } drop"
+          nft_rule PORTKNOCK_CHAIN "meta nfproto ipv6 $reset6 $match update @$set6 { ip6 saddr timeout ${PORTKNOCK_SEQ_TIMEOUT}s } drop"
         fi
       fi
     fi
@@ -1598,6 +1693,14 @@ plugin_start()
     prev4="$set4"
     prev6="$set6"
   done
+
+  if [ "${PORTKNOCK_STRICT:-0}" = "1" ]; then
+    portknock_add_reset_rules "$seq_norm" "$use_v4" "$use_v6"
+    for iface in $jump_ifaces; do
+      [ -n "$iface" ] || continue
+      nft_insert EXT_INPUT_CHAIN "$(nft_if iifname "$iface") jump PORTKNOCK_RESET_CHAIN"
+    done
+  fi
 
   # Hook the chain into the external input path. Appending (not inserting)
   # keeps earlier plugin checks (eg. SSH brute-force protection) first.

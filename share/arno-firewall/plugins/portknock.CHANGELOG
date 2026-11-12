@@ -28,6 +28,13 @@ Port Knocking plugin
         verifies the dynamic element is gone and the target accept rule and
         interface jump still exist. A failed verification logs a warning
         instead of the normal close message.
+      - Optional strict non-monotonic sequence validation: disabled by default;
+        when enabled, a strictly ascending or descending sequence disables the
+        plugin.
+      - Optional early reset-on-other protection: disabled by default; when
+        enabled, only the next expected sequence port is allowed and any other
+        new TCP/UDP packet resets the in-progress sequence. A short suppression
+        marker prevents the reset source from immediately starting over.
       - No separate close-log setting; PORTKNOCK_LOG controls open messages,
         normal close messages, and close-check warnings.
       - Config is installed root-only (0600); .netset/BLOCK_HOSTS bans take
