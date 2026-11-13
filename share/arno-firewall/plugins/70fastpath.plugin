@@ -2,7 +2,7 @@
 #            -= Arno's (NFT) Firewall(ANF) - Flow Offload (fastpath) =-
 #
 PLUGIN_NAME="Flow Offload (fastpath) plugin (PC Engines APU2)"
-PLUGIN_VERSION="1.08"
+PLUGIN_VERSION="1.09"
 PLUGIN_CONF_FILE="fastpath.conf"
 #
 # Last changed          : November 13, 2026
@@ -10,10 +10,11 @@ PLUGIN_CONF_FILE="fastpath.conf"
 # Target hardware       : PC Engines APU2 (AMD GX-412TC quad-core, Intel i211
 #                         "igb" NICs), typically with a PPPoE WAN.
 # Comments              : Enable the nftables flowtable fastpath for forwarded
-#                         traffic (in an isolated "inet fastpath" table), and
-#                         optionally tune flowtable timeouts, the CPU scaling
-#                         governor and the NIC ring buffers, and flush stale
-#                         conntrack entries when the WAN address changes.
+#                         IPv4 and (with IPV6_SUPPORT=1) IPv6 TCP/UDP traffic
+#                         (in an isolated "inet fastpath" table), and optionally
+#                         tune flowtable timeouts, the CPU scaling governor and
+#                         the NIC ring buffers, and flush stale conntrack
+#                         entries when the WAN address changes.
 #
 # Web                   : https://github.com/arno-firewall/anf
 # ------------------------------------------------------------------------------

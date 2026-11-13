@@ -3,6 +3,13 @@ Flow Offload (fastpath) plugin
 
 Target hardware: PC Engines APU2.
 
+1.09  - Match IPv6 TCP/UDP by transport protocol (meta l4proto) instead of
+        the immediate IPv6 next header. This gives IPv6 the same TCP/UDP
+        fastpath coverage as IPv4 and no longer excludes packets solely
+        because they carry IPv6 extension headers. Some extension-header or
+        fragmented flows may still fall back to the normal forwarding path.
+        IPv6 WAN tracking is unchanged.
+
 1.08  - Security hardening: existing state files must be regular, root-owned
         and mode 0600. Unsafe state files are removed and rebuilt instead of
         being trusted or permanently disabling the fastpath.

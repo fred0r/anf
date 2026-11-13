@@ -329,7 +329,7 @@ fastpath_helper_main()
     printf '%s\n' "  chain FASTPATH_CHAIN {"
     printf '%s\n' "    type filter hook forward priority filter + 1; policy accept;"
     printf '%s\n' "    ip protocol { tcp, udp } ct state established flow add @fp"
-    [ "${IPV6_SUPPORT:-0}" = "1" ] && printf '%s\n' "    ip6 nexthdr { tcp, udp } ct state established flow add @fp"
+    [ "${IPV6_SUPPORT:-0}" = "1" ] && printf '%s\n' "    meta nfproto ipv6 meta l4proto { tcp, udp } ct state established flow add @fp"
     printf '%s\n' "  }"
     printf '%s\n' "}"
   } > "$tmp"
