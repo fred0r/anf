@@ -2,10 +2,10 @@
 #            -= Arno's (NFT) Firewall(ANF) - Flow Offload (fastpath) =-
 #
 PLUGIN_NAME="Flow Offload (fastpath) plugin (PC Engines APU2)"
-PLUGIN_VERSION="1.07"
+PLUGIN_VERSION="1.08"
 PLUGIN_CONF_FILE="fastpath.conf"
 #
-# Last changed          : November 5, 2026
+# Last changed          : November 13, 2026
 # Requirements          : ANF 3.0.0 (or newer)
 # Target hardware       : PC Engines APU2 (AMD GX-412TC quad-core, Intel i211
 #                         "igb" NICs), typically with a PPPoE WAN.
@@ -50,7 +50,8 @@ FASTPATH_WAN_IP6_STATE="/var/tmp/anf_fastpath_wan_ip6s"
 
 
 # Only regular files may be used for our state. A symlink (or any other type)
-# is left alone, so it can never redirect a root write somewhere else.
+# is left alone, so it can never redirect a root write somewhere else. Existing
+# files must be root-owned mode 0600, so an unprivileged user cannot seed state.
 fastpath_state_safe()
 {
   local file="$1"
@@ -58,8 +59,9 @@ fastpath_state_safe()
   [ -n "$file" ] || return 1
   [ -L "$file" ] && return 1
   [ -e "$file" ] && [ ! -f "$file" ] && return 1
+  [ -f "$file" ] || return 0
 
-  return 0
+  [ "$(find "$file" -user root -perm 600 -print 2>/dev/null)" = "$file" ]
 }
 
 
@@ -259,8 +261,7 @@ plugin_sanity_check()
   fi
 
   if [ "${FASTPATH_FLUSH_CONNTRACK:-1}" = "1" ] && ! check_command conntrack; then
-    printf "\033[40m\033[1;31m${INDENT}ERROR: Required command conntrack is not available!\033[0m\n" >&2
-    return 1
+    printf "\033[40m\033[1;33m${INDENT}WARNING: The conntrack command is not available; stale WAN sessions will not be flushed!\033[0m\n" >&2
   fi
 
   return 0

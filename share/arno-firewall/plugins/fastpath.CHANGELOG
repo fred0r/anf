@@ -3,6 +3,17 @@ Flow Offload (fastpath) plugin
 
 Target hardware: PC Engines APU2.
 
+1.08  - Security hardening: existing state files must be regular, root-owned
+        and mode 0600. Unsafe state files are removed and rebuilt instead of
+        being trusted or permanently disabling the fastpath.
+      - Include the IPv6 mode in the fastpath fingerprint, so changing
+        IPV6_SUPPORT rebuilds the flowtable even when
+        FASTPATH_FLUSH_ON_RESTART=0.
+      - The conntrack command is optional: without it, ANF warns and skips
+        stale-conntrack cleanup instead of refusing to start the fastpath.
+        Stale established TCP sessions then follow the kernel conntrack
+        timeout (5 days by default).
+
 1.07  - Detect global WAN IPv6 address changes when IPV6_SUPPORT=1, flush
         stale IPv6 conntrack entries (FASTPATH_FLUSH_CONNTRACK) and force a
         flowtable rebuild. Link-local addresses are ignored; temporary and
