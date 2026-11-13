@@ -14,7 +14,9 @@ PLUGIN_CONF_FILE="fastpath.conf"
 #                         (in an isolated "inet fastpath" table), and optionally
 #                         tune flowtable timeouts, the CPU scaling governor and
 #                         the NIC ring buffers, and flush stale conntrack
-#                         entries when the WAN address changes.
+#                         entries when the WAN address changes. IPv6 fastpath
+#                         covers direct TCP/UDP only; extension-header and
+#                         fragmented flows stay on the normal forwarding path.
 #
 # Web                   : https://github.com/arno-firewall/anf
 # ------------------------------------------------------------------------------
