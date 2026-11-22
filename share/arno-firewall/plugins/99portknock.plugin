@@ -1255,7 +1255,7 @@ portknock_warn_chain()
         *'comment "portknock"'*) continue ;;
       esac
       portknock_warn_line "$chain" "$rule"
-      case "$rule" in
+      case " $rule " in
         *" jump "*|*" goto "*) ;;
         *) continue ;;
       esac
@@ -1272,6 +1272,9 @@ EOF
       return 0
     fi
     while IFS= read -r rule; do
+      case "$rule" in
+        *'comment "portknock"'*) continue ;;
+      esac
       portknock_warn_line "$chain" "$rule"
       case " $rule " in
         *" jump "*|*" goto "*) ;;
@@ -1518,6 +1521,7 @@ portknock_add_reset_rules()
     if [ -n "$set4" ]; then
       if [ "$proto" = "tcp" ]; then
         nft_rule PORTKNOCK_RESET_CHAIN "meta nfproto ipv4 meta l4proto tcp ct state new tcp dport != $port ip saddr @$set4 update @anf_pk_reset_4 { ip saddr timeout 1s } delete @$set4 { ip saddr }"
+        nft_rule PORTKNOCK_RESET_CHAIN "meta nfproto ipv4 meta l4proto tcp ct state new tcp dport $port tcp flags & (syn|ack) != syn ip saddr @$set4 update @anf_pk_reset_4 { ip saddr timeout 1s } delete @$set4 { ip saddr }"
         nft_rule PORTKNOCK_RESET_CHAIN "meta nfproto ipv4 meta l4proto udp ct state new ip saddr @$set4 update @anf_pk_reset_4 { ip saddr timeout 1s } delete @$set4 { ip saddr }"
       else
         nft_rule PORTKNOCK_RESET_CHAIN "meta nfproto ipv4 meta l4proto tcp ct state new ip saddr @$set4 update @anf_pk_reset_4 { ip saddr timeout 1s } delete @$set4 { ip saddr }"
@@ -1528,6 +1532,7 @@ portknock_add_reset_rules()
     if [ -n "$set6" ]; then
       if [ "$proto" = "tcp" ]; then
         nft_rule PORTKNOCK_RESET_CHAIN "meta nfproto ipv6 meta l4proto tcp ct state new tcp dport != $port ip6 saddr @$set6 update @anf_pk_reset_6 { ip6 saddr timeout 1s } delete @$set6 { ip6 saddr }"
+        nft_rule PORTKNOCK_RESET_CHAIN "meta nfproto ipv6 meta l4proto tcp ct state new tcp dport $port tcp flags & (syn|ack) != syn ip6 saddr @$set6 update @anf_pk_reset_6 { ip6 saddr timeout 1s } delete @$set6 { ip6 saddr }"
         nft_rule PORTKNOCK_RESET_CHAIN "meta nfproto ipv6 meta l4proto udp ct state new ip6 saddr @$set6 update @anf_pk_reset_6 { ip6 saddr timeout 1s } delete @$set6 { ip6 saddr }"
       else
         nft_rule PORTKNOCK_RESET_CHAIN "meta nfproto ipv6 meta l4proto tcp ct state new ip6 saddr @$set6 update @anf_pk_reset_6 { ip6 saddr timeout 1s } delete @$set6 { ip6 saddr }"
